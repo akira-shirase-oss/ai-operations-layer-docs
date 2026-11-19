@@ -1,0 +1,460 @@
+#!/usr/bin/env node
+// Runs the docs' examples against a real AI Operations Layer collector and fails on any
+// difference from what the pages show. The examples live in the MDX itself:
+//
+//   ```sh run=quickstart                  a command, run in order in one bash session per suite
+//   ```sh run=cli exit=1                  a command the page shows failing: it must end with that status
+//   ```sh run=cli stderr=1                its standard error is part of its output (an `error:` line)
+//   ```text output=ops match=lines        a stream: every line shown must arrive, in any order
+//   ```json output=quickstart             what the command before it prints; compared after
+//                                          normalising ids, times, keys and hashes
+//   ```sh title="handler.py" run=quickstart file=handler.py   written to handler.py in the current directory
+//   {/* snippet quickstart: snippets/steps.sh */}   a script sourced at that point
+//
+// Every suite runs in one bash session, in the order of SUITES (later suites use what earlier ones
+// export, such as AIOPS_INGEST_KEY); a page's blocks run in document order. A block with
+// `step=NAME` in its info string can be left out with `--skip NAME`.
+//
+//   node scripts/snippets.mjs                       check every suite (CI: the quick start's own
+//                                                   install block brings the collector up)
+//   node scripts/snippets.mjs --base http://127.0.0.1:58540 --db postgres://aiops:aiops-dev@127.0.0.1:58532/aiops --skip install
+//                                                   against a stack already running elsewhere
+//   node scripts/snippets.mjs --update ...          write what ran into the pages' output blocks
+//   node scripts/snippets.mjs --list                print the steps without running them
+//   node scripts/snippets.mjs --coverage            count every code block: run, a checked output,
+//                                                   or `not-run="reason"`; fails on any other block
+//
+// Addresses. Hosted pages show https://aiops.example.com, a reserved domain (RFC 2606). The pages
+// that run on this machine show the collector's own default address, http://127.0.0.1:57400, plus
+// postgres://aiops:aiops-dev@127.0.0.1:57432/aiops for the database (the defaults the product's
+// scripts/stack.sh prints). At run time each shown address is swapped for the real one: --base
+// for the collector and --db for the database, so a developer's allotted port band is honoured and
+// the outputs compare equal either way.
+//
+// A block that can't run here (a systemd unit, a Cloudflare step, a shape rather than a command)
+// says so in its info string, `not-run="why"`, so the gap is counted and visible, never silent. One
+// that could run but isn't wired up yet says `not-run="todo: why"`, and is counted apart.
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const ROOT = resolve(new URL('..', import.meta.url).pathname);
+const DOCS = join(ROOT, 'src/content/docs');
+/**
+ * The address pages show. Examples use https://aiops.example.com, a domain reserved for examples
+ * (RFC 2606); the local pages show http://127.0.0.1:57400, aiops-server's own default listen
+ * address, where the reader really runs it.
+ */
+export const EXAMPLE_BASE = 'https://aiops.example.com';
+const DEFAULT_BASE = 'http://127.0.0.1:57400';
+/** The other local address pages show: the development PostgreSQL from the product's compose file. */
+const SHOWN_DB = 'postgres://aiops:aiops-dev@127.0.0.1:57432/aiops';
+const LOCAL_PAGES = /content\/docs\/(quick-start|cli|instrument|console)\.mdx$|content\/docs\/self-hosting\/|content\/docs\/adapters\//;
+/** The address a page shows its examples with. */
+export const shownBase = (file) => (LOCAL_PAGES.test(file ?? '') ? DEFAULT_BASE : EXAMPLE_BASE);
+/** Suites in the order they run; later suites build on the state earlier ones leave. */
+const SUITES = ['quickstart', 'ingest', 'api', 'sdk', 'cli', 'ops'];
+
+const args = process.argv.slice(2);
+const flag = (name) => args.includes(`--${name}`);
+const option = (name, fallback) => {
+	const at = args.indexOf(`--${name}`);
+	return at === -1 ? fallback : args[at + 1];
+};
+const base = option('base', DEFAULT_BASE);
+const db = option('db', SHOWN_DB);
+const skip = new Set((option('skip', '') || '').split(',').filter(Boolean));
+const only = option('suite', '');
+const workdir = resolve(option('cwd', join(ROOT, '.snippets/work')));
+
+/** The host:port form a flag like AIOPS_LISTEN takes: no scheme, but the same shown address. */
+const hostPort = (url) => new URL(url).host;
+
+/**
+ * A block's code as it runs: the example domain and every shown local address becomes the stack's.
+ * The database URL goes first (it contains a host:port that must not be touched by the bare-port
+ * pass for the collector), then the full URLs, then the bare host:port form —
+ * `AIOPS_LISTEN=127.0.0.1:57400` is the same shown address without its scheme.
+ */
+export const runnable = (code, stack = base, database = db) =>
+	code
+		.replaceAll(SHOWN_DB, database)
+		.replaceAll(EXAMPLE_BASE, stack)
+		.replaceAll(DEFAULT_BASE, stack)
+		.replaceAll(hostPort(DEFAULT_BASE), hostPort(stack))
+		// Last, the bare port — a flag may take a port, not a URL. Whole words only, and after the
+		// host:port pass so `127.0.0.1:57400` isn't turned into `127.0.0.1:<mapped>` twice.
+		.replace(new RegExp(`\\b${new URL(DEFAULT_BASE).port}\\b`, 'g'), new URL(stack).port);
+
+// ---------------------------------------------------------------- reading the pages
+
+function mdxFiles(dir) {
+	return readdirSync(dir)
+		.flatMap((name) => {
+			const path = join(dir, name);
+			return statSync(path).isDirectory() ? mdxFiles(path) : path.endsWith('.mdx') ? [path] : [];
+		})
+		.sort();
+}
+
+// The indent is spaces and tabs only: `\s` would let a match start on the blank line before a fence and
+// then look for a closing fence after a blank line too, swallowing the blocks in between.
+const FENCE = /^([ \t]*)(`{3,})([\w-]*)([^\n]*)\n([\s\S]*?)\n\1\2[ \t]*$/gm;
+/** Every fenced block in a page's text: `[indent, fence, lang, info, body]` per match. */
+export const fences = (text) => [...text.matchAll(FENCE)];
+const COMMENT = /\{\/\*\s*snippet\s+([\w-]+):\s*(\S+)((?:\s+[^\s*]\S*)*)\s*\*\/\}/g;
+// A key starts the info string or follows a space, so `run=` never matches inside `not-run=`.
+const meta = (text, key) => text.match(new RegExp(`(?:^|\\s)${key}=("([^"]*)"|\\S+)`))?.[2] ?? text.match(new RegExp(`(?:^|\\s)${key}=(\\S+)`))?.[1];
+
+/** Every step of every suite, in document order. */
+function readSteps() {
+	const steps = [];
+	for (const file of mdxFiles(DOCS)) {
+		const text = readFileSync(file, 'utf8');
+		const found = [];
+		for (const match of text.matchAll(FENCE)) {
+			const [, indent, , lang, info, body] = match;
+			const run = meta(info, 'run');
+			const output = meta(info, 'output');
+			if (!run && !output) continue;
+			const code = body
+				.split('\n')
+				.map((line) => (line.startsWith(indent) ? line.slice(indent.length) : line))
+				.join('\n');
+			found.push({ at: match.index, kind: run ? 'run' : 'output', suite: run ?? output, lang, info, code, file, start: match.index, end: match.index + match[0].length, indent });
+		}
+		for (const match of text.matchAll(COMMENT)) {
+			found.push({ at: match.index, kind: 'script', suite: match[1], path: match[2], args: (match[3] ?? '').trim(), file });
+		}
+		found.sort((a, b) => a.at - b.at);
+		for (const step of found) {
+			if (step.kind === 'output') {
+				const previous = steps.findLast((candidate) => candidate.suite === step.suite);
+				if (!previous || previous.kind !== 'run' || previous.expect) throw new Error(`${relative(ROOT, file)}: an output block with no command before it`);
+				previous.expect = step;
+			} else {
+				steps.push(step);
+			}
+		}
+	}
+	for (const step of steps) if (!SUITES.includes(step.suite)) throw new Error(`${relative(ROOT, step.file)}: unknown suite "${step.suite}"`);
+	return steps;
+}
+
+// ---------------------------------------------------------------- normalising output
+
+/** Split `curl -i` output into its head and body; anything else is all body. */
+function split(text) {
+	const normal = text.replace(/\r\n/g, '\n');
+	if (/^HTTP\/[\d.]+ \d{3}/.test(normal)) {
+		const at = normal.indexOf('\n\n');
+		return at === -1 ? { head: normal.trimEnd(), body: '' } : { head: normal.slice(0, at), body: normal.slice(at + 2) };
+	}
+	return { head: null, body: normal };
+}
+
+/** JSON bodies are compared by value, and shown indented. */
+function jsonBody(body) {
+	const trimmed = body.trim();
+	if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
+	try {
+		return JSON.parse(trimmed);
+	} catch {
+		return null;
+	}
+}
+
+/** A JSON body indented, with every number exactly as the server wrote it (`45.0` stays `45.0`). */
+function indent(body) {
+	try {
+		const exact = JSON.parse(body.trim(), (key, value, context) => (typeof value === 'number' ? JSON.rawJSON(context.source) : value));
+		return JSON.stringify(exact, null, 2);
+	} catch {
+		return null;
+	}
+}
+
+/** What the page shows: headers as they came, a JSON body indented, local addresses as the page writes them. */
+export function display(text, file) {
+	const { head, body } = split(
+		text
+			.replace(new RegExp(escape(base), 'g'), shownBase(file))
+			.replace(new RegExp(escape(db), 'g'), SHOWN_DB),
+	);
+	const json = jsonBody(body);
+	const shown = json === null ? body.trimEnd() : (indent(body) ?? JSON.stringify(json, null, 2));
+	return head === null ? shown : shown === '' ? head : `${head}\n\n${shown}`;
+}
+
+const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** What is compared: values that differ on every run become placeholders. */
+export function normalise(text) {
+	const { head, body } = split(
+		text
+			.replace(new RegExp(escape(base), 'g'), '<base>')
+			.replace(new RegExp(escape(db), 'g'), '<db>')
+			.replaceAll(DEFAULT_BASE, '<base>')
+			.replaceAll(SHOWN_DB, '<db>')
+			.replaceAll(EXAMPLE_BASE, '<base>')
+			.replaceAll(escape(workdir), '<work>'),
+	);
+	const json = jsonBody(body);
+	const flatBody = json === null ? body.trim() : JSON.stringify(json);
+	const all = `${head ?? ''}\n\n${flatBody}`
+		.replace(/aiops_ik_[A-Za-z0-9_-]{43}/g, 'aiops_ik_<key>') // ingest keys are printed once, never the same
+		.replace(/aiops_tk_[A-Za-z0-9_-]{43}/g, 'aiops_tk_<token>') // API tokens likewise
+		.replace(/\b[0-9a-f]{64}\b/g, '<hex64>')
+		.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '<uuid>')
+		.replace(/\b[0-9a-f]{32}\b/g, '<hex32>') // event, operation, instance, trace ids
+		.replace(/\b[0-9a-f]{16}\b/g, '<hex16>') // step ids (64-bit, the OTel span width)
+		.replace(/sha256:[0-9a-f]{64}/g, 'sha256:<hash>')
+		.replace(/\b[0-9a-f]{40}\b/g, '<commit>')
+		.replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z/g, '<time>')
+		.replace(/"(receive_delay_us|duration_us|cost_estimate_micros)":-?\d+/g, '"$1":<us>')
+		.replace(/"finished_at_ms":\d+/g, '"finished_at_ms":<ms>')
+		.replace(/"read_at":"[^"]+"/g, '"read_at":"<time>"')
+		.replace(/^date: .*$/gim, 'date: <date>')
+		.replace(/^content-length: \d+$/gim, 'content-length: <n>')
+		.replace(/^retry-after: \d+$/gim, 'retry-after: <seconds>')
+		.replace(/\(commit [^,)]+, built \d{4}-\d\d-\d\d\)/g, '(commit <commit>, built <day>)')
+		.replace(/[ \t]+$/gm, '');
+	return all.trim();
+}
+
+/**
+ * Whether what ran matches the page's output block. Normally the whole normalised text must be equal. With
+ * `match=lines` (a stream, whose frames a server may merge or add to), every line the page shows must be
+ * among the lines that arrived, in any order: the page shows real frames, and losing one still fails.
+ */
+export function matches(actual, expect) {
+	if (meta(expect.info ?? '', 'match') !== 'lines') return normalise(actual) === normalise(expect.code);
+	const seen = new Set(normalise(actual).split('\n'));
+	return normalise(expect.code)
+		.split('\n')
+		.filter((line) => line.trim() !== '')
+		.every((line) => seen.has(line));
+}
+
+// ---------------------------------------------------------------- the product checkout
+
+const PRODUCT_URL = 'https://github.com/akira-shirase-oss/ai-operations-layer.git';
+/**
+ * The ref the examples run against: what the pages document. AIOPS_LAYER_REF overrides it — CI's
+ * nightly sets `main` so a product change that moves under the docs is caught there.
+ */
+const PRODUCT_REF = process.env.AIOPS_LAYER_REF || 'main';
+
+const gitIn = (dir, ...args) => {
+	const result = spawnSync('git', ['-C', dir, ...args], { encoding: 'utf8' });
+	if (result.status !== 0) {
+		console.error(`snippets: git ${args.join(' ')} in ${relative(ROOT, dir)} failed:\n${result.stderr}`);
+		process.exit(1);
+	}
+	return result.stdout.trim();
+};
+const runOrDie = (cmd, args) => {
+	const result = spawnSync(cmd, args, { stdio: 'inherit' });
+	if (result.status !== 0) {
+		console.error(`snippets: ${cmd} ${args.join(' ')} failed — see above`);
+		process.exit(1);
+	}
+};
+
+/**
+ * One mechanism owns the product source: before any step runs, .snippets/work/ai-operations-layer
+ * is an ai-operations-layer checkout at PRODUCT_REF. A missing dir is cloned; a dir that exists
+ * without .git — a restored build cache holding only target/, as CI's rust-cache step leaves — is
+ * fetched into rather than deleted, so the cache still warms the build. An existing checkout is
+ * left alone unless AIOPS_LAYER_REF was set explicitly. Afterwards the dir must be a source tree,
+ * not just a directory — anything else stops the suite here with a readable message, not a cargo error.
+ */
+function ensureProductCheckout() {
+	const dir = join(workdir, 'ai-operations-layer');
+	mkdirSync(workdir, { recursive: true });
+	if (!existsSync(join(dir, '.git'))) {
+		if (existsSync(dir)) {
+			console.error(`snippets: ${relative(ROOT, dir)} exists but is not a checkout — fetching ${PRODUCT_REF} into it (keeps a restored target/ cache)`);
+			// --template= skips copying sample hooks — a scratch checkout doesn't need them.
+			runOrDie('git', ['init', '-q', '--template=', dir]);
+			gitIn(dir, 'remote', 'add', 'origin', PRODUCT_URL);
+			gitIn(dir, 'fetch', '-q', '--depth', '1', 'origin', PRODUCT_REF);
+			gitIn(dir, 'checkout', '-q', '--detach', 'FETCH_HEAD');
+		} else {
+			runOrDie('git', ['clone', '-q', '--depth', '1', '-b', PRODUCT_REF, PRODUCT_URL, dir]);
+		}
+	} else if (process.env.AIOPS_LAYER_REF) {
+		gitIn(dir, 'fetch', '-q', '--depth', '1', 'origin', PRODUCT_REF);
+		gitIn(dir, 'checkout', '-q', '--detach', 'FETCH_HEAD');
+	}
+	if (!existsSync(join(dir, 'Cargo.toml'))) {
+		console.error(`snippets: ${relative(ROOT, dir)} is not an ai-operations-layer source tree — remove it and rerun`);
+		process.exit(1);
+	}
+	console.error(`snippets: ai-operations-layer ${gitIn(dir, 'describe', '--tags', '--always')} (ref ${PRODUCT_REF})`);
+}
+
+// ---------------------------------------------------------------- running a suite
+
+function runAll(steps) {
+	const dir = join(ROOT, '.snippets', 'run');
+	mkdirSync(dir, { recursive: true });
+	mkdirSync(workdir, { recursive: true });
+	// Aliases work as in an interactive shell (the CLI page defines one), so each block is sourced
+	// from its own file: a later line sees what an earlier one defined.
+	const lines = [
+		'set -euo pipefail',
+		'shopt -s expand_aliases',
+		// However the run ends — a failing step, an early stop — the collector it started is its
+		// own child; reap it so a stopped suite never leaves a stale port.
+		"trap 'kill $(jobs -p) 2>/dev/null || true' EXIT",
+		`cd ${JSON.stringify(workdir)}`,
+		`export BASE=${JSON.stringify(base)}`,
+		`export AIOPS_DB=${JSON.stringify(db)}`,
+		`export SNIPPET_HOME=${JSON.stringify(workdir)}`,
+	];
+	steps.forEach((step, index) => {
+		const out = join(dir, `${index}.out`);
+		const marker = `echo "=== step ${index}: ${relative(ROOT, step.file)}" >&2`;
+		if (step.kind === 'script') {
+			// A script may read what the command before it printed, as $SNIPPET_LAST.
+			const last = steps.slice(0, index).findLast((earlier) => earlier.kind === 'run' && !meta(earlier.info, 'file'));
+			const lastOut = last ? join(dir, `${steps.indexOf(last)}.out`) : '/dev/null';
+			lines.push(marker, `export SNIPPET_LAST=${JSON.stringify(lastOut)}`, `source ${JSON.stringify(join(ROOT, step.path))}${step.args ? ` ${step.args}` : ''}`);
+			return;
+		}
+		const code = runnable(step.code);
+		const file = meta(step.info, 'file');
+		if (file) {
+			lines.push(marker, `cat > ${JSON.stringify(file)} <<'DOCS_SNIPPET_EOF'`, code, 'DOCS_SNIPPET_EOF');
+			return;
+		}
+		if (skip.has(meta(step.info, 'step') ?? '')) {
+			lines.push(`echo "=== step ${index}: skipped (${meta(step.info, 'step')})" >&2`);
+			return;
+		}
+		const source = join(dir, `${index}.sh`);
+		writeFileSync(source, `${code}\n`);
+		// `exit=N`: a command the page shows failing; it must end with that status. `stderr=1`: what
+		// it prints on standard error is part of its output too (an `error:` line, a summary).
+		const expected = meta(step.info, 'exit');
+		const streams = meta(step.info, 'stderr') === '1' ? ' 2>&1' : '';
+		if (expected === undefined) {
+			lines.push(marker, `source ${JSON.stringify(source)} > ${JSON.stringify(out)}${streams}`);
+		} else {
+			lines.push(
+				marker,
+				'set +e',
+				`source ${JSON.stringify(source)} > ${JSON.stringify(out)}${streams}`,
+				'__status=$?',
+				'set -e',
+				`[[ $__status == ${Number(expected)} ]] || { echo "step ${index}: exit $__status, the page says ${Number(expected)}" >&2; cat ${JSON.stringify(out)} >&2; exit 1; }`,
+			);
+		}
+	});
+	const script = join(dir, 'suite.sh');
+	writeFileSync(script, `${lines.join('\n')}\n`);
+	const result = spawnSync('bash', [script], { stdio: ['ignore', 'inherit', 'inherit'], env: process.env });
+	if (result.status !== 0) {
+		console.error(`snippets: the run stopped (exit ${result.status}); its script is ${relative(ROOT, script)}`);
+		return false;
+	}
+	let ok = true;
+	steps.forEach((step, index) => {
+		if (step.kind !== 'run' || !step.expect) return;
+		const outFile = join(dir, `${index}.out`);
+		// A suite that stopped early leaves no .out for the steps it never reached — count them
+		// as differences (the run already failed) instead of crashing on the missing file.
+		const actual = statSync(outFile, { throwIfNoEntry: false }) ? readFileSync(outFile, 'utf8') : '';
+		step.actual = actual;
+		if (!matches(actual, step.expect)) {
+			ok = false;
+			console.error(`\nsnippets: ${relative(ROOT, step.file)}: the output differs from the page for:\n${step.code}\n--- the page (normalised)\n${normalise(step.expect.code)}\n--- the collector (normalised)\n${normalise(actual)}\n`);
+		}
+	});
+	return ok;
+}
+
+function update(steps) {
+	const byFile = new Map();
+	for (const step of steps) {
+		// Only blocks whose output really differs are rewritten, so ids and dates don't churn.
+		if (step.kind === 'run' && step.expect && step.actual !== undefined && !matches(step.actual, step.expect)) {
+			const list = byFile.get(step.file) ?? [];
+			list.push(step.expect.end === undefined ? null : step);
+			byFile.set(step.file, list);
+		}
+	}
+	for (const [file, list] of byFile) {
+		let text = readFileSync(file, 'utf8');
+		for (const step of list.sort((a, b) => b.expect.start - a.expect.start)) {
+			const { indent, info, lang, start, end } = step.expect;
+			const fence = '```';
+			const body = display(step.actual, step.file)
+				.split('\n')
+				.map((line) => (line === '' ? '' : `${indent}${line}`))
+				.join('\n');
+			text = `${text.slice(0, start)}${indent}${fence}${lang}${info}\n${body}\n${indent}${fence}${text.slice(end)}`;
+		}
+		writeFileSync(file, text);
+		console.log(`snippets: wrote ${list.length} output block(s) into ${relative(ROOT, file)}`);
+	}
+}
+
+// ---------------------------------------------------------------- coverage
+
+/** Every fenced block on every page, by what happens to it. */
+export function coverage() {
+	const pages = [];
+	for (const file of mdxFiles(DOCS)) {
+		const text = readFileSync(file, 'utf8');
+		const page = { file: relative(DOCS, file), run: 0, output: 0, notRun: 0, todo: 0, unmarked: [] };
+		for (const match of text.matchAll(FENCE)) {
+			const info = match[4];
+			if (meta(info, 'run')) page.run++;
+			else if (meta(info, 'output')) page.output++;
+			else if (meta(info, 'not-run')?.startsWith('todo:')) page.todo++;
+			else if (meta(info, 'not-run')) page.notRun++;
+			else page.unmarked.push(text.slice(0, match.index).split('\n').length);
+		}
+		if (page.run + page.output + page.notRun + page.todo + page.unmarked.length > 0) pages.push(page);
+	}
+	return pages;
+}
+
+function printCoverage() {
+	const pages = coverage();
+	const sum = (key) => pages.reduce((total, page) => total + (Array.isArray(page[key]) ? page[key].length : page[key]), 0);
+	for (const page of pages) {
+		console.log(`${page.file.padEnd(36)} run ${String(page.run).padStart(3)}  output ${String(page.output).padStart(3)}  not-run ${String(page.notRun).padStart(3)}  todo ${String(page.todo).padStart(3)}${page.unmarked.length ? `  UNMARKED at lines ${page.unmarked.join(', ')}` : ''}`);
+	}
+	const all = sum('run') + sum('output') + sum('notRun') + sum('todo') + sum('unmarked');
+	console.log(`snippets coverage: ${all} blocks; ${sum('run')} run, ${sum('output')} outputs checked, ${sum('notRun')} can't run here (with a reason), ${sum('todo')} could run but aren't wired yet (not-run="todo: …"), ${sum('unmarked')} unmarked`);
+	process.exit(sum('unmarked') > 0 ? 1 : 0);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) main();
+
+function main() {
+	if (flag('coverage')) printCoverage();
+	const steps = readSteps();
+	const suites = SUITES.filter((name) => (only ? name === only : true)).map((name) => [name, steps.filter((step) => step.suite === name)]);
+	if (flag('list')) {
+		for (const [name, list] of suites) {
+			console.log(`${name}: ${list.length} steps`);
+			for (const step of list) console.log(`  ${step.kind.padEnd(6)} ${relative(ROOT, step.file)} ${step.kind === 'script' ? step.path : (step.code.split('\n')[0] ?? '').slice(0, 100)}${step.expect ? '  [checked]' : ''}`);
+		}
+		process.exit(0);
+	}
+	const ordered = suites.flatMap(([name, list]) => {
+		if (list.length > 0) console.log(`snippets: suite ${name}, ${list.length} steps`);
+		return list;
+	});
+	ensureProductCheckout();
+	const failed = !runAll(ordered);
+	if (flag('update')) update(steps);
+	const checked = steps.filter((step) => step.expect && step.actual !== undefined).length;
+	console.log(`snippets: ${checked} outputs checked${failed ? ', with differences' : ', all match'}`);
+	process.exit(failed && !flag('update') ? 1 : 0);
+}
