@@ -5,13 +5,13 @@ description: The single error shape every route returns, and the codes to branch
 
 Every route — probes aside — returns the same error shape, so a client needs one code path:
 
-```json not-run="the error shape"
-{"code": "project_not_in_scope", "message": "the token's projects do not include docs"}
+```json not-run="the error envelope"
+{"error": {"code": "forbidden", "message": "forbidden: no_adapter", "request_id": "…"}}
 ```
 
-HTTP status carries the class; `code` carries the machine-readable cause; `message` is for humans.
-Refusals and rate limits are errors of the same shape — `409` and `503` are *readable refusals*, never
-pretend successes.
+HTTP status carries the class; `error.code` carries the machine-readable cause; `error.message` is for
+humans and `error.request_id` correlates a report with the collector's logs. Refusals and rate limits
+are errors of the same shape — `409` and `503` are *readable refusals*, never pretend successes.
 
 ## Statuses to branch on
 
@@ -21,7 +21,7 @@ pretend successes.
 | `401` | `unauthenticated` — missing or bad credential | Re-check the header; mint a new key/token. |
 | `403` | `project_not_in_scope`, `forbidden` — the credential works, just not for this | Check the token's projects/scopes via `GET /v1/projects`. |
 | `404` | `not_found` — no such operation in this project | It's absent or expired; check the id and `detail_expired`. |
-| `409` | A refusal with a code: `instance_owned_by_another_key` and control-path refusals | Read `code`; it names the conflict. |
+| `409` | A refusal with a code: `instance_owned_by_another_key`, `conflicting_request` (a control record exists for the operation, action and key with a different `expected_state`) | Read `code`; it names the conflict. The stored record stands — see [Recovering an uncertain operation](/recovering/). |
 | `413` | `payload_too_large`, `too_many_events` | Split the batch; see [bounds](/ingest-contract/#bounds-and-the-answers-they-get). |
 | `429` | `rate_limited` | Wait `Retry-After` seconds and retry — the header is always present. |
 | `503` | `overloaded` (shed load, auth-lookup budget spent, body budget spent) or `store_unavailable` | Back off and retry; `overloaded` answers before any body byte is read. |
