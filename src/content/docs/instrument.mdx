@@ -4,14 +4,16 @@ description: Emit operations, steps and gap reports from Rust code — bounded, 
 ---
 
 `aiops-sdk` is the crate your host service emits through. Everything on this page runs on your machine
-against a local collector (`AIOPS_ENDPOINT` defaults to `http://127.0.0.1:57400`).
+against a local collector (`AIOPS_ENDPOINT` points at it; the suite resets to a fresh `docs` project first).
+
+{/* snippet sdk: snippets/restart.sh */}
 
 Its guarantees are the point:
 
 - **Never blocks the request path beyond its bound.** Emitting is a non-blocking enqueue into a
   bounded queue; a full queue **drops and counts**.
-- **Never panics.** Calls return `Result`; the SDK — and your service — keep working when the
-  collector is down.
+- **Never panics.** Calls return values or mark the client failed; the SDK — and your service — keep
+  working when the collector is down.
 - **Every drop is counted** and every counter is exposable to the host; `stats` ride on every batch
   so the latest cumulative values survive lost batches.
 - **Context propagation** follows OTel-compatible formats; event payloads conform to the versioned
@@ -23,56 +25,67 @@ Its guarantees are the point:
 ```toml not-run="a Cargo.toml fragment, not a command"
 [dependencies]
 aiops-sdk = { path = "../ai-operations-layer/crates/aiops-sdk" }
+tokio = { version = "1", features = ["full"] }
 ```
 
-The SDK reads its endpoint and key from the environment the collector gave you:
+The SDK takes its endpoint and ingest key explicitly (the environment is the usual source):
 
-```sh run=sdk step=sdk-env not-run="todo: wire the sdk suite to a built reference example"
+```sh run=sdk
 export AIOPS_ENDPOINT=http://127.0.0.1:57400
-export AIOPS_INGEST_KEY=aiops_ik_…   # from admin create-ingest-key
 ```
 
-```rust not-run="a Rust example compiled by the product's own test suite (crates/aiops-sdk/examples)"
-use aiops_sdk::{Client, ClientConfig, Step};
+```rust not-run="a Rust excerpt; the runnable version is crates/aiops-sdk/examples/first_operation.rs"
+use aiops_sdk::{Client, Config, Finish, StepKind, UncertainReason};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let client = Client::new(ClientConfig::from_env()?)?;
+let client = Client::start(&Config::new(endpoint, key, "checkout"))?;
+let op = client.operation("checkout.answer").request_id("req-42").start();
 
-    // One operation: ids and op_seq are managed for you; finishes are declared, not inferred.
-    let op = client.operation("checkout.answer")
-        .release("2026.46")
-        .start()?;
+// A model step that failed before it left the host, retried, then succeeded.
+let generate = op.step(StepKind::Model, "draft-reply").model("acme-small-4").start();
+let retry = generate
+    .finish(Finish::failed(aiops_sdk::FailureClass::Transport, "connect_refused"))
+    .retry()
+    .start();
+retry.finish(Finish::succeeded().usage(132, 480).cost_estimate(2_052, "USD", "list-price"));
 
-    let step = op.step(Step::model("draft-reply").model_name("acme-small-4")).start()?;
-    // … call the model …
-    step.finish_succeeded()
-        .usage(812, 144)
-        .cost_estimate_micros(91_000, "USD", "price-card-2026-10")
-        .await?;
+// A publish whose reply never came: the effect may have happened.
+let publish = op.step(StepKind::Tool, "publish").external_effect(true).start();
+publish.finish(Finish::uncertain(UncertainReason::TimeoutAfterSend, "publish_timeout"));
 
-    op.finish_succeeded().await?;   // declares events_emitted so coverage can count
-    client.shutdown().await?;       // flushes what the queue holds, then stops
-    Ok(())
-}
+op.finish(Finish::uncertain(UncertainReason::TimeoutAfterSend, "publish_timeout"));
+let stats = client.shutdown(std::time::Duration::from_secs(2)).await;
 ```
 
-If the collector is unreachable, `finish_*` calls still succeed — events sit in the bounded queue and
-are flushed when it recovers; if the queue overflows, `dropped_queue_full` rises and the next batch's
+Outcomes are **declared**: `Finish::succeeded()`, `Finish::failed(class, code)`,
+`Finish::uncertain(reason, code)`. A `finish().retry().start()` is how a retried attempt is written —
+the timeline shows both attempts, the failed one counted.
+
+## Run the real example
+
+The product ships `crates/aiops-sdk/examples/first_operation.rs` — the same shape as above, end to
+end. Run it against your local collector:
+
+```sh run=sdk
+cargo run --release -p aiops-sdk --example first_operation
+```
+
+```text output=sdk
+emitted 8 events: 8 accepted, 0 dropped (every drop is counted)
+```
+
+The operation appears in the console under request ID `example-1` — one operation, a retried model
+step, an `external_effect` publish whose finish is `uncertain` (flagged: the effect may have
+happened), and an `uncertain` operation finish.
+
+## What happens with the collector down
+
+The same example finishes anyway: events sit in the bounded queue, flush when the collector recovers,
+and `stats.dropped()` counts what the deadline or a full queue lost — the next successful batch's
 `stats` reports it, so the loss is visible in the console rather than silent.
-
-## What to read on the wire
-
-Every event the SDK emits is the contract from [the ingest contract](/ingest-contract/): dotted
-`type`s, per-instance `seq`, per-operation `op_seq`, `event_id` as the dedup key, `event_time` on the
-wire and `received_at` added by the collector.
 
 ## Marking effects and uncertainty
 
 A step that may change the outside world — charge a card, send an email, merge a PR — should be
-declared with `external_effect`, and a request that left the host without a usable answer finishes
-`uncertain` with one of the three reasons. The timeline then flags it: *the effect may have happened*.
-That is the honest state to act on — check the authoritative store, don't blindly retry.
-
-See the runnable example in the product repository at `crates/aiops-sdk/examples/first_operation.rs`,
-which this SDK's own tests exercise end-to-end.
+declared with `.external_effect(true)`, and a request that left the host without a usable answer
+finishes `uncertain` with one of the three reasons. The timeline then flags it: *the effect may have
+happened* — check the authoritative store, don't blindly retry.

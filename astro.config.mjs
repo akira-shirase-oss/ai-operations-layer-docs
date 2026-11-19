@@ -5,8 +5,11 @@ import starlightLinksValidator from 'starlight-links-validator';
 import starlightLlmsTxt from 'starlight-llms-txt';
 import { focusableCode } from './src/lib/focusable-code.mjs';
 
-// The one place the public address lives: canonical URLs, the sitemap, llms.txt and the changelog feed derive from it.
-const site = 'https://docs.ai-operations-layer.404human.dev';
+// The one place the public address lives: canonical URLs, the sitemap, llms.txt and the changelog
+// feed derive from it. DOCS_SITE overrides it for a deploy that serves another origin (a pages.dev
+// preview) — page and asset links stay relative either way, so the build is the same; only the
+// canonical/sitemap base moves.
+const site = process.env.DOCS_SITE ?? 'https://docs.ai-operations-layer.404human.dev';
 const repo = 'https://github.com/akira-shirase-oss/ai-operations-layer-docs';
 
 export default defineConfig({
