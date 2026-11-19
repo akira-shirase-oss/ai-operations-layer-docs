@@ -20,8 +20,9 @@ for pidfile in .srv.pid .refhost.pid; do
 done
 
 # Empty the database and migrate again — same thing the product's own test stack does.
+# The schema lives in the AIOPS_DB database itself; connecting to "postgres" would reset nothing.
 if command -v psql >/dev/null 2>&1; then
-	psql "${AIOPS_DB%/aiops}/postgres" -v ON_ERROR_STOP=1 -q -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+	psql "$AIOPS_DB" -v ON_ERROR_STOP=1 -q -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
 elif command -v docker >/dev/null 2>&1; then
 	docker compose -f deploy/compose.yaml exec -T postgres psql -U aiops -d aiops -v ON_ERROR_STOP=1 -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
 else
