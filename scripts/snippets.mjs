@@ -62,8 +62,10 @@ const option = (name, fallback) => {
 	const at = args.indexOf(`--${name}`);
 	return at === -1 ? fallback : args[at + 1];
 };
-const base = option('base', DEFAULT_BASE);
-const db = option('db', SHOWN_DB);
+// The flags win; the environment is the fallback — CI exports BASE/AIOPS_DB for the stack it
+// provisioned (a service Postgres on 5432 rather than the compose file's documented 57432).
+const base = option('base', process.env.BASE ?? DEFAULT_BASE);
+const db = option('db', process.env.AIOPS_DB ?? SHOWN_DB);
 const skip = new Set((option('skip', '') || '').split(',').filter(Boolean));
 const only = option('suite', '');
 const workdir = resolve(option('cwd', join(ROOT, '.snippets/work')));
