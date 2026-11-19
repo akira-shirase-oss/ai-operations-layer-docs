@@ -1,0 +1,38 @@
+---
+title: Backups and restore
+description: What to back up, what restores, and what a restore can never bring back.
+---
+
+Everything the collector knows lives in **one PostgreSQL database** — events, summaries, project and
+credential hashes, audit records, instance stats. Back it up with ordinary PostgreSQL tooling; the
+reference setup ships logical dumps to object storage and rehearses restores.
+
+```sh not-run="backup tooling — runs against your Postgres, not the collector"
+pg_dump "$AIOPS_DATABASE_URL" --format=custom --file=aiops-$(date +%F).dump
+```
+
+## What a backup contains — and what it doesn't
+
+- **Contained:** raw events (until retention expires them), operation summaries, projects,
+  credential *hashes*, opt-in lists, audit rows, per-instance stats.
+- **Not contained:** usable credentials. The store keeps hashes, so a leaked dump can't be used to
+  ingest or read — but rotate on restore anyway; you can't prove who saw the backup.
+
+## Restore drill
+
+```sh not-run="restore tooling — runs against a fresh Postgres"
+createdb aiops_restored
+pg_restore --dbname=aiops_restored aiops-2026-11-17.dump
+AIOPS_DATABASE_URL=postgres://…/aiops_restored aiops-server migrate   # bring schema current
+```
+
+Point a collector at the restored database behind `/readyz`. Verify by asking for a known operation's
+timeline — summaries and surviving raw events are all there. Events past their retention cutoff were
+deleted *before* the backup too: `detail_expired` operations restore with their summaries intact and
+their detail absent — exactly as they stood.
+
+## The honest gap
+
+A restore recovers what was **stored**, not what was **sent**. Events dropped before ingest — a dead
+collector window, an SDK queue overflow — were never in the database; they stay visible as the gaps
+they were (`missing_op_seq`, `reported_dropped`), not as recovered data. A backup cannot invent them.

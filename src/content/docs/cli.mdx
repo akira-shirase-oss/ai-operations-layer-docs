@@ -1,0 +1,87 @@
+---
+title: The admin CLI
+description: "aiops-server's operator commands — projects, keys, tokens, opt-ins — everything below runs on this machine."
+---
+
+All administration goes through `aiops-server admin`, which talks straight to the database —
+`AIOPS_DATABASE_URL` must be set; the server need not be running. Everything on this page runs on your
+machine (the suite resets to a fresh `docs` project first).
+
+{/* snippet cli: snippets/restart.sh */}
+
+```sh run=cli
+export AIOPS_DATABASE_URL=postgres://aiops:aiops-dev@127.0.0.1:57432/aiops
+./target/release/aiops-server --help | head -20
+```
+
+## Projects
+
+```sh run=cli
+./target/release/aiops-server admin create-project billing
+```
+
+```text output=cli
+project billing <uuid>
+```
+
+Slugs are lowercase letters, digits and dashes.
+
+## Ingest keys
+
+```sh run=cli
+./target/release/aiops-server admin create-ingest-key --project docs --name web-1
+```
+
+```text output=cli
+aiops_ik_<key>
+```
+
+```sh run=cli
+./target/release/aiops-server admin revoke-ingest-key --project docs --name web-1
+```
+
+```text output=cli
+revoked ingest key web-1 of docs
+```
+
+A revoked key stops working within 30 s (the valid-key cache lifetime).
+
+## API tokens
+
+```sh run=cli
+./target/release/aiops-server admin create-token --actor sam --project docs --scope read --ttl-days 30
+```
+
+```text output=cli
+aiops_tk_<token>
+```
+
+Repeat `--project` for several projects and `--scope` for several scopes (`read`, `operate`, `admin`).
+The id and expiry print on stderr (`token <id> for <actor>, expires <time>`); revoke by id:
+
+```sh not-run="the id comes from create-token's stderr — revoke by that id"
+./target/release/aiops-server admin revoke-token <token-id>
+```
+
+## Attribute opt-ins
+
+Default metadata carries no prompts, content or secrets; a project opts extra attribute keys in
+deliberately (empty clears the list):
+
+```sh run=cli
+./target/release/aiops-server admin set-opt-in --project docs "customer_tier,experiment"
+```
+
+```text output=cli
+docs opt-in keys: ["customer_tier", "experiment"]
+```
+
+Non-opt-in attribute keys are withheld on ingest and counted as `withheld_attributes` — the opt-in
+list is the allowlist.
+
+## The other two commands
+
+```sh not-run="migrate needs a live database; serve runs forever — both are shown in the quick start"
+./target/release/aiops-server migrate        # apply schema migrations
+./target/release/aiops-server serve          # run the collector + API + console
+```

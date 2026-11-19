@@ -1,0 +1,47 @@
+---
+title: AI Operations Layer
+description: What the AI Operations Layer is, what it is for, and the one thing it never does.
+---
+
+The **AI Operations Layer** is an open-source observability and controlled-recovery layer you add to an
+application that calls AI models, runs tools, or dispatches jobs. It answers the question its users
+actually have: *what did this one operation really do — from the request, through each model call, tool
+call and job, to the outcome — and how much of that do we actually know?*
+
+It has four parts:
+
+- **`aiops-sdk`** — a library your host service emits events through. Emitting never blocks the request
+  path beyond its bound; a full queue drops and *counts*, and the SDK keeps working when the collector
+  is down.
+- **`aiops-server`** — the collector and API. It ingests authenticated, bounded batches idempotently,
+  assembles each operation's timeline, and serves the permissioned HTTP API.
+- **The console** — a SvelteKit UI served at `/console/`. It is a client of the same API everything
+  else uses, with a bearer token — no hidden queries, no independent authority.
+- **`aiops-server admin`** — the operator CLI: projects, ingest keys, API tokens, attribute opt-ins.
+
+## Telemetry is evidence, never authority
+
+The layer's one rule, from which everything else follows: **telemetry describes observed behaviour; it
+never authorizes a retry, a refund, a publication, or any other business action.** A timeline that shows
+a payment step's outcome as *uncertain* is a reason to check the authoritative store — not a reason to
+retry the step, and never proof the step did or didn't run.
+
+Gaps in the telemetry are first-class data, not noise to hide: collector downtime, dropped events and
+incomplete traces are recorded and rendered with counts. An operation that never declared a finish is
+`no_finish_observed` — not "running", not "did not run".
+
+## Who these docs are for
+
+| You are… | Start with |
+|---|---|
+| Adding observability to a service | [Quick start](/quick-start/), then [the Rust SDK](/instrument/) |
+| Investigating an operation in the console | [The console](/console/) |
+| Calling the API yourself | [Which API, when](/api/), [Authentication](/api/authentication/), the [API reference](/api/reference/) |
+| Running the collector yourself | [Self-hosting](/self-hosting/configuration/), [the admin CLI](/cli/) |
+
+## Where to next
+
+- [Quick start](/quick-start/) — a running collector and a real authenticated API call in minutes.
+- [Concepts](/concepts/) — operations, the two clocks, gaps as data, estimates vs. bills.
+- [The ingest contract](/ingest-contract/) — the versioned wire format events travel in.
+- [Changelog](/changelog/) — what changed, newest first.

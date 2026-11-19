@@ -1,0 +1,53 @@
+---
+title: Monitoring and operations
+description: The probes, the counters, the retention sweeper, and the states that mean something is wrong.
+---
+
+Everything below runs on this machine — the suite resets the collector first.
+
+{/* snippet ops: snippets/restart.sh */}
+
+## Probes
+
+```sh run=ops
+curl -s http://127.0.0.1:57400/healthz; echo
+curl -s http://127.0.0.1:57400/readyz
+```
+
+```text output=ops
+ok
+{"ready":true,"store":"reachable"}
+```
+
+- `/healthz` — process liveness; never touches the store.
+- `/readyz` — 200 only when PostgreSQL answers inside a second; 503 `{"ready":false,"store":"unreachable"}` otherwise. This is the signal your load balancer should gate on.
+
+## Counters
+
+`GET /v1/collector/stats` needs an `admin` token:
+
+```sh run=ops
+curl -s http://127.0.0.1:57400/v1/collector/stats \
+  -H "Authorization: Bearer $AIOPS_ADMIN_TOKEN" | head -c 600; echo
+```
+
+The view reports batches, `events_accepted` / `events_duplicate` / `events_refused` /
+`events_conflicting`, `attributes_withheld`, `redactions`, `unauthenticated`, `shed`, `rate_limited`,
+`denied`, `store_unavailable`, `auth_shed`, and the in-process lock wait/hold times. Rising
+`events_refused` or `dropped` counters mean telemetry is being lost **and counted** — the console
+shows the same numbers as gaps.
+
+## Retention
+
+Raw events expire on a schedule; summaries survive. The sweeper runs inside the server; expired
+detail shows on timelines as `expired_by_retention` / `retention_cutoff` and on lists as
+`detail_expired` — a deleted event leaves a visible mark, never a silent hole.
+
+## The states that mean "look now"
+
+- `store_unavailable` rising → Postgres is flapping; `/readyz` will already be failing.
+- `auth_shed` rising → credential-lookup budget exhausted, probably a key flood.
+- `shed`/`rate_limited` rising → the bounds in [Capacity](/self-hosting/capacity/) need raising, or
+  the load needs shedding earlier at the edge.
+- Conflicting or `no_finish_observed` operations piling up → instrumented hosts are dying mid-flight
+  or losing their finish path; that's a *host* signal, surfaced honestly.

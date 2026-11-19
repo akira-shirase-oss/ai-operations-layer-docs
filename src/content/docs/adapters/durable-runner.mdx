@@ -1,0 +1,40 @@
+---
+title: Durable Runner hosts
+description: The reference adapter — deriving an operation id from a run, and the live authority link the console verifies.
+---
+
+This page's examples run on this machine: a Durable Runner and this collector side by side.
+
+The AI Operations Layer's first execution authority is **Durable Runner**. Two things connect them:
+
+## 1. The operation id derives from the run
+
+The host emits telemetry whose `operation_id` is a deterministic function of the runner name and run
+id — `operation_for_run(runner, run_id)` — so the same run always maps to the same operation, across
+retries and restarts. The events also carry the link attributes naming the runner and the run.
+
+## 2. The authority read is live and verified
+
+`GET …/operations/{id}/authority` doesn't trust the telemetry's claim. It:
+
+1. Finds the link attributes on the operation's start events.
+2. **Verifies** the named run actually derives to this operation id (`link_unverified` otherwise — the
+   claim is not believed).
+3. Asks the runner's public API **live**, with a bounded body read, and returns its verbatim answer —
+   `{"state":"answered", "answer":{state,key,steps,finished_at_ms}, "read_at":…}` — or an explicit
+   non-answer: `not_configured`, `not_linked`, `unknown_runner`, `unavailable` (with `reason`:
+   `busy`, `timeout`, `unreachable`, `not_found`, `unauthorized`, `bad_answer`).
+
+An `unavailable` is never smoothed over: the console shows the authority could not be asked, nothing
+is inferred in its place, and no business conclusion is drawn.
+
+## Configuring the link
+
+The collector learns the runner's address from its config — see
+[Configuration](/self-hosting/configuration/). Point it at the runner's API origin (locally, the
+runner's own listen address), and operations whose start events carry the runner link attributes get a
+live authority panel in the console.
+
+The rule that makes the integration safe stays the product's first invariant: **the runner's answer is
+authority; the telemetry is evidence about the same run. When they disagree, the authority wins — and
+the disagreement is itself displayed.**

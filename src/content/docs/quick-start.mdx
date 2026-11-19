@@ -1,0 +1,142 @@
+---
+title: Quick start
+description: A running collector, a project with credentials, one operation ingested, and a real authenticated API call — all on this machine.
+---
+
+Everything on this page runs **on your machine**: the collector listens on `127.0.0.1:57400` and stores
+in a local PostgreSQL. When you're done you will have minted a real API token and read back an
+operation you sent in.
+
+You need a Rust toolchain and a PostgreSQL you can create a database on (the project's compose file
+provides one; any reachable Postgres works).
+
+## 1. Build the collector
+
+```sh run=quickstart step=install
+[ -d ai-operations-layer ] || git clone https://github.com/akira-shirase-oss/ai-operations-layer.git
+cd ai-operations-layer
+cargo build --release -p aiops-server
+```
+
+The binary is `target/release/aiops-server` — collector, API, admin CLI and console statics in one.
+
+## 2. Point it at PostgreSQL
+
+With the project's compose file:
+
+```sh not-run="needs Docker; a compose step, not a shell command in this suite"
+docker compose -f deploy/compose.yaml up -d postgres
+```
+
+That compose service listens on `127.0.0.1:57432` with user and database `aiops`. Point the collector
+at it (use your own URL if Postgres is elsewhere):
+
+```sh run=quickstart
+export AIOPS_DATABASE_URL=postgres://aiops:aiops-dev@127.0.0.1:57432/aiops
+```
+
+## 3. Migrate and serve
+
+```sh run=quickstart
+./target/release/aiops-server migrate
+```
+
+Now start the collector in the background and wait for it to report ready:
+
+```sh run=quickstart
+AIOPS_LISTEN=127.0.0.1:57400 ./target/release/aiops-server serve >/dev/null 2>&1 &
+for i in $(seq 1 50); do curl -sf http://127.0.0.1:57400/readyz && break; sleep 0.2; done
+```
+
+```json output=quickstart
+{"ready":true,"store":"reachable"}
+```
+
+`/readyz` only answers 200 when the store actually answers — a running-but-disconnected collector is
+`503`, which is the honest signal to a load balancer.
+
+## 4. Create a project and credentials
+
+The admin commands talk straight to the database (no server needed):
+
+```sh run=quickstart
+./target/release/aiops-server admin create-project quickstart
+```
+
+```text output=quickstart
+project quickstart <uuid>
+```
+
+Two credential kinds exist, for two different jobs. An **ingest key** can only send telemetry:
+
+```sh run=quickstart
+AIOPS_INGEST_KEY=$(./target/release/aiops-server admin create-ingest-key --project quickstart --name laptop)
+```
+
+An **API token** reads — it carries an actor, scopes and a project list:
+
+```sh run=quickstart
+AIOPS_TOKEN=$(./target/release/aiops-server admin create-token --actor you --project quickstart --scope read)
+```
+
+Both are printed **once**; the store keeps only their hashes. Treat them like passwords.
+
+## 5. Send one operation
+
+The wire format is a batch: a `source` block naming this emitting instance, its cumulative drop
+counters, and the events. Here is an operation with one model step that succeeded:
+
+```sh run=quickstart
+curl -s http://127.0.0.1:57400/v1/ingest \
+  -H "Authorization: Bearer $AIOPS_INGEST_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": 1,
+    "source": {"instance_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "service": "checkout", "sdk": "hand-rolled/0"},
+    "stats": {"dropped_queue_full": 0, "dropped_send_failed": 0, "dropped_rejected": 0, "gap_overflow": 0, "truncated_events": 0},
+    "events": [
+      {"event_id": "11111111111111111111111111111111", "type": "operation.started", "operation_id": "22222222222222222222222222222222", "seq": 1, "op_seq": 1, "event_time": "2026-11-17T10:00:00Z", "name": "checkout.answer", "release": "2026.46"},
+      {"event_id": "33333333333333333333333333333333", "type": "step.started", "operation_id": "22222222222222222222222222222222", "seq": 2, "op_seq": 2, "event_time": "2026-11-17T10:00:00.2Z", "step_id": "4444444444444444", "kind": "model", "name": "draft-reply", "attempt": 1, "model": "acme-small-4"},
+      {"event_id": "55555555555555555555555555555555", "type": "step.finished", "operation_id": "22222222222222222222222222222222", "seq": 3, "op_seq": 3, "event_time": "2026-11-17T10:00:01.1Z", "step_id": "4444444444444444", "attempt": 1, "outcome": "succeeded", "usage": {"input_tokens": 812, "output_tokens": 144}, "cost_estimate": {"micros": 91000, "currency": "USD", "basis": "price-card-2026-10"}},
+      {"event_id": "66666666666666666666666666666666", "type": "operation.finished", "operation_id": "22222222222222222222222222222222", "seq": 4, "op_seq": 4, "event_time": "2026-11-17T10:00:01.4Z", "outcome": "succeeded", "events_emitted": 4}
+    ]
+  }'
+```
+
+```json output=quickstart
+{"accepted":4,"duplicates":0,"refused":[]}
+```
+
+Send the same batch again and `duplicates` counts it — `event_id` is the dedup key for the whole path.
+A resend is never a second event.
+
+## 6. The real API call
+
+Now read it back with the API token — this is the same call the console makes:
+
+```sh run=quickstart
+curl -s http://127.0.0.1:57400/v1/projects/quickstart/operations \
+  -H "Authorization: Bearer $AIOPS_TOKEN" \
+  | head -c 400; echo
+```
+
+The response lists your operation with `status.state: "succeeded"` — the status the host *declared* on
+its `operation.finished`, not something the collector inferred. The full timeline (steps, attempts,
+coverage, cost estimate) is one call deeper:
+
+```sh run=quickstart
+curl -s http://127.0.0.1:57400/v1/projects/quickstart/operations/22222222222222222222222222222222 \
+  -H "Authorization: Bearer $AIOPS_TOKEN" \
+  | head -c 200; echo
+```
+
+And the console is already running: open `http://127.0.0.1:57400/console/` and paste the token you
+minted — the token lives only in that tab's `sessionStorage`, and the console calls exactly the API
+you just used.
+
+## What's next
+
+- [Concepts](/concepts/) — what `no_finish_observed` means, why there are two clocks, gaps as data.
+- [The Rust SDK](/instrument/) — emit from real code instead of curl.
+- [The ingest contract](/ingest-contract/) — every field and every refusal.
+- [Authentication and keys](/api/authentication/) — scopes, revocation, rotation.

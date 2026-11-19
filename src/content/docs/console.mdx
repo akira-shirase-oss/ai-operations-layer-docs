@@ -1,0 +1,59 @@
+---
+title: The console
+description: What the console shows, how its token works, and how to read uncertainty, gaps and authority states.
+---
+
+The console is served by the collector itself at `/console/` — the same origin as the API, so no CORS
+and no second deploy. On a local collector that's `http://127.0.0.1:57400/console/`.
+
+It is **a client of the same permissioned API** everything else uses. It holds no authority, runs no
+hidden queries, and its requests are the documented routes you can call yourself.
+
+## Signing in
+
+Mint a read token (`admin create-token --actor you --project … --scope read`) and paste it. The token
+is kept **only in that tab's `sessionStorage` under `aiops.token`** — closing the tab forgets it; nothing
+is written to `localStorage`, a cookie or IndexedDB.
+
+Every API result lands in one of the console's explicit states — `ok`, `needsAuth` (401), `forbidden`
+(403), `missing` (404), `rateLimited` (429), `unreachable` (network/5xx) — so a collector that is down
+or a token that is wrong reads as *that*, never as an empty dashboard pretending all is well. Refusals
+(HTTP 409/503 on control sends) render as readable refusals, not successes.
+
+## Reading the operations list
+
+The list is stored summaries — first/last event time, declared status, events received vs. emitted,
+reported drops, failed/uncertain attempts, cost estimate. Filters map to the API's parameters: status
+(the five states), name, release, request id, time window. An operation whose raw events aged out under
+retention still appears, marked — `detail_expired` — because the summary survives.
+
+## Reading a timeline
+
+One operation, top to bottom:
+
+- **Status** — the host-declared state, with `class`/`reason`/`code` where they exist.
+- **Flags** — `conflicting_finish`, `clock_skew_suspected`, `late_events`, `start_not_observed`,
+  `external_effect_unknown`, `missing_events_may_hide_effects`, retried/failed/uncertain attempt counts.
+- **Coverage** — received vs. emitted, exact `op_seq` holes, per-instance completeness and the
+  `tail_unknown` marker on instances that haven't finished or gone silent.
+- **Steps** — per-attempt rows with model, versions, durations, token usage and cost estimates.
+- **Entries** — every stored event with both clocks (`event_time`, `received_at`, `receive_delay_us`),
+  policy marks (withheld attributes, redactions, truncation) intact.
+- **Gaps** — the stretches the record knows it's missing, rendered as gaps — never interpolated into a
+  clean-looking timeline.
+
+Unknown, uncertain and gap states are first-class renders by design: a missing span is not drawn as
+"did not run", and an unfinished operation is `no_finish_observed`, not "running".
+
+## The authority panel
+
+For operations linked to a Durable Runner run, the console calls `GET …/authority` live and shows the
+authority's own answer — `answered`, `not_configured`, `not_linked`, `unknown_runner`,
+`link_unverified` or `unavailable` — with `read_at`. An authority that can't be asked is shown as
+unavailable; telemetry never fills in for it.
+
+## What the console will not do
+
+It will not show a token after you paste it, will not infer an outcome a host didn't declare, and will
+not turn a missing span into "didn't happen" or a lost batch into zero. If a number you need is
+absent, that absence is itself the information.

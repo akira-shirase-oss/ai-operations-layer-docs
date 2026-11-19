@@ -1,0 +1,621 @@
+{
+	"openapi": "3.1.0",
+	"info": {
+		"title": "AI Operations Layer API",
+		"version": "0.1.0",
+		"description": "The HTTP API of the AI Operations Layer collector: authenticated ingest of telemetry batches, and the permissioned query surface the console and every other client uses.\n\nTelemetry is evidence, never authority: nothing the API returns may authorize a retry, refund or publication on its own, and gaps in the telemetry are shown as gaps, never as success.\n\nTwo credential kinds exist. An **ingest key** (`aiops_ik_…`) authorizes only `POST /v1/ingest`. An **API token** (`aiops_tk_…`) carries an actor, scopes (`read`, `operate`, `admin`) and a project list, and authorizes the query routes. Health probes are unauthenticated.",
+		"license": { "name": "Apache-2.0 OR MIT" }
+	},
+	"servers": [
+		{ "url": "https://aiops.example.com", "description": "A hosted collector (replace with your own origin)" },
+		{ "url": "http://127.0.0.1:57400", "description": "The quick start on this machine" }
+	],
+	"tags": [
+		{ "name": "probes", "description": "Unauthenticated liveness and readiness." },
+		{ "name": "ingest", "description": "Batched telemetry from instrumented hosts, authenticated by ingest key." },
+		{ "name": "query", "description": "The permissioned read surface, authenticated by API token." },
+		{ "name": "authority", "description": "What the execution authority says about an operation — read live from the authority, never inferred from telemetry." }
+	],
+	"paths": {
+		"/healthz": {
+			"get": {
+				"tags": ["probes"],
+				"summary": "Liveness probe",
+				"operationId": "healthz",
+				"description": "The process is alive. Answers `ok` without touching the store.",
+				"responses": {
+					"200": { "description": "The collector process is running.", "content": { "text/plain": { "schema": { "type": "string", "example": "ok" } } } }
+				}
+			}
+		},
+		"/readyz": {
+			"get": {
+				"tags": ["probes"],
+				"summary": "Readiness probe",
+				"operationId": "readyz",
+				"description": "The store answers within one second. 200 when the collector can serve; 503 when PostgreSQL is unreachable.",
+				"responses": {
+					"200": { "description": "Ready.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ready" } } } },
+					"503": { "description": "The store is unreachable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Ready" } } } }
+				}
+			}
+		},
+		"/v1/ingest": {
+			"post": {
+				"tags": ["ingest"],
+				"summary": "Ingest a batch of events",
+				"operationId": "ingestBatch",
+				"description": "One batch: a `source` block naming the emitting instance, the instance's own drop counters in `stats`, and up to the configured maximum events.\n\nIngest is idempotent by `event_id`: a resent event counts as a duplicate, never a second event, and a duplicated event under a *different* operation is refused rather than merged. Individual events can be refused without failing the batch; refusals come back per index, never silently dropped. The whole batch is refused with an error status when the schema version is wrong, the body is malformed or too large, the key can't be read, or the key is rate-limited.",
+				"security": [{ "ingestKey": [] }],
+				"requestBody": {
+					"required": true,
+					"content": { "application/json": { "schema": { "$ref": "#/components/schemas/Batch" } } }
+				},
+				"responses": {
+					"200": {
+						"description": "The batch was processed; per-event refusals are in `refused`.",
+						"content": { "application/json": { "schema": { "$ref": "#/components/schemas/IngestResponse" } } }
+					},
+					"400": { "description": "Malformed body or unsupported schema version.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"401": { "description": "Missing or bad ingest key.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"413": { "description": "The batch exceeds the body limit or event-count limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"429": { "description": "The key's rate limiter refused the batch; retry after the `Retry-After` hint.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"503": { "description": "The collector shed the load or the store is unavailable.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/projects": {
+			"get": {
+				"tags": ["query"],
+				"summary": "The token's actor, scopes and projects",
+				"operationId": "listProjects",
+				"description": "Who the bearer token acts as, which scopes it holds, and which projects it may read. The console calls this first.",
+				"security": [{ "apiToken": [] }],
+				"responses": {
+					"200": { "description": "The token's view.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProjectsView" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/projects/{project}/operations": {
+			"get": {
+				"tags": ["query"],
+				"summary": "List operations",
+				"operationId": "listOperations",
+				"description": "Operations in one project, newest first, from stored summaries — not raw events. Filter by status, name, request id, release or time window; page with `before_time`/`before_id` from the previous response's `next`.",
+				"security": [{ "apiToken": ["read"] }],
+				"parameters": [
+					{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Project slug." },
+					{ "name": "limit", "in": "query", "schema": { "type": "integer" }, "description": "Page size (bounded by the server's limits)." },
+					{ "name": "status", "in": "query", "schema": { "type": "string", "enum": ["succeeded", "failed", "uncertain", "conflicting", "no_finish_observed"] } },
+					{ "name": "name", "in": "query", "schema": { "type": "string" }, "description": "Operation name." },
+					{ "name": "release", "in": "query", "schema": { "type": "string" } },
+					{ "name": "request_id", "in": "query", "schema": { "type": "string" } },
+					{ "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "RFC 3339: operations whose first event time is at or after it." },
+					{ "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "RFC 3339: operations whose first event time is before it." },
+					{ "name": "before_time", "in": "query", "schema": { "type": "string" }, "description": "Pass back `next` for the next page." },
+					{ "name": "before_id", "in": "query", "schema": { "type": "string" } }
+				],
+				"responses": {
+					"200": { "description": "One page of operations.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OperationList" } } } },
+					"400": { "description": "A bad parameter (unknown status, overlong identifier, unparseable time).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"403": { "description": "The project isn't in the token's scope.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"429": { "description": "Query rate limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/projects/{project}/operations/{operation_id}": {
+			"get": {
+				"tags": ["query"],
+				"summary": "An operation's timeline",
+				"operationId": "getTimeline",
+				"description": "The full correlated view of one operation: declared status, flags, coverage (including known and unknown gaps), per-attempt steps, every stored entry, sources, cost estimates and retention state. Uncertainty is part of the payload — `no_finish_observed`, missing `op_seq` ranges, clock-skew and conflicting-finish flags are data, not errors.",
+				"security": [{ "apiToken": ["read"] }],
+				"parameters": [
+					{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+					{ "name": "operation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+				],
+				"responses": {
+					"200": { "description": "The operation's timeline.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Timeline" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"403": { "description": "The project isn't in the token's scope.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"404": { "description": "No operation by that id in this project.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"429": { "description": "Query rate limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/projects/{project}/operations/{operation_id}/authority": {
+			"get": {
+				"tags": ["authority"],
+				"summary": "What the execution authority says",
+				"operationId": "getAuthority",
+				"description": "Reads the configured execution authority (today: a Durable Runner deployment) live, after verifying that the named run derives to this operation. The answer is one of six explicit states — `answered`, `not_configured`, `not_linked`, `unknown_runner`, `link_unverified`, `unavailable` — so an authority that can't be reached is never silently replaced by a telemetry guess.",
+				"security": [{ "apiToken": ["read"] }],
+				"parameters": [
+					{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+					{ "name": "operation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+				],
+				"responses": {
+					"200": { "description": "The authority's state, tagged by `state`.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Authority" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"403": { "description": "The project isn't in the token's scope.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"404": { "description": "No operation by that id in this project.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/projects/{project}/releases/compare": {
+			"get": {
+				"tags": ["query"],
+				"summary": "Compare releases over one window",
+				"operationId": "compareReleases",
+				"description": "Up to four releases side by side over the same window, built from the same summaries and statuses the operations list uses. A release whose operations lost events or never finished shows that in its own columns — never as success. A release with no operations in the window is listed with zeros, never dropped.",
+				"security": [{ "apiToken": ["read"] }],
+				"parameters": [
+					{ "name": "project", "in": "path", "required": true, "schema": { "type": "string" } },
+					{ "name": "releases", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Comma-separated release names, at most four." },
+					{ "name": "from", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "RFC 3339 start of the window (the comparison caps at seven days)." },
+					{ "name": "to", "in": "query", "schema": { "type": "string", "format": "date-time" }, "description": "RFC 3339 end of the window." }
+				],
+				"responses": {
+					"200": { "description": "The comparison.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Comparison" } } } },
+					"400": { "description": "Bad parameters (more than four releases, a window over seven days, unparseable times).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"403": { "description": "The project isn't in the token's scope.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		},
+		"/v1/collector/stats": {
+			"get": {
+				"tags": ["query"],
+				"summary": "Collector counters",
+				"operationId": "collectorStats",
+				"description": "The counters the collector keeps about itself: batches, accepted/duplicate/refused/conflicting events, withheld attributes and redactions, unauthenticated and denied calls, shed and rate-limited requests, store-unavailable count, and the in-process lock wait/hold times. Requires the `admin` scope.",
+				"security": [{ "apiToken": ["admin"] }],
+				"responses": {
+					"200": { "description": "The collector's counters.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MetricsView" } } } },
+					"401": { "description": "Missing or bad token.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+					"403": { "description": "The token lacks the `admin` scope.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+				}
+			}
+		}
+	},
+	"components": {
+		"securitySchemes": {
+			"ingestKey": { "type": "http", "scheme": "bearer", "description": "An ingest key (`aiops_ik_…`), scoped to one project and usable only for `POST /v1/ingest`. Printed once by `aiops-server admin create-ingest-key`." },
+			"apiToken": { "type": "http", "scheme": "bearer", "description": "An API token (`aiops_tk_…`) with an actor, scopes (`read`, `operate`, `admin`) and a project list. Printed once by `aiops-server admin create-token`." }
+		},
+		"schemas": {
+			"Error": {
+				"type": "object",
+				"description": "The single error shape every route returns: a machine-readable `code` plus a readable `message`. HTTP 409 refusals and 503 unavailability use the same shape.",
+				"properties": {
+					"code": { "type": "string", "example": "unauthenticated" },
+					"message": { "type": "string", "example": "a bearer credential is required" }
+				},
+				"required": ["code", "message"]
+			},
+			"Ready": {
+				"type": "object",
+				"properties": {
+					"ready": { "type": "boolean" },
+					"store": { "type": "string", "enum": ["reachable", "unreachable"] }
+				},
+				"required": ["ready", "store"]
+			},
+			"Source": {
+				"type": "object",
+				"description": "The emitting instance a batch speaks for.",
+				"properties": {
+					"instance_id": { "type": "string", "description": "Stable id of this host instance; its `seq` numbering is per instance." },
+					"service": { "type": "string" },
+					"sdk": { "type": "string", "description": "SDK name and version, e.g. `aiops-sdk/0.1.0`." }
+				},
+				"required": ["instance_id", "service", "sdk"]
+			},
+			"BatchStats": {
+				"type": "object",
+				"description": "The instance's own drop counters — loss the SDK already knows about, reported rather than hidden.",
+				"properties": {
+					"dropped_queue_full": { "type": "integer", "format": "int64" },
+					"dropped_send_failed": { "type": "integer", "format": "int64" },
+					"dropped_rejected": { "type": "integer", "format": "int64" },
+					"gap_overflow": { "type": "integer", "format": "int64" },
+					"truncated_events": { "type": "integer", "format": "int64" }
+				}
+			},
+			"WireEvent": {
+				"type": "object",
+				"description": "One event in the versioned wire contract (`docs/INGEST_CONTRACT.md` in the product repository). Per type, only the listed fields may appear — anything else is refused `field_not_allowed`. `event_id`, `type`, `operation_id`, `seq`, `op_seq` and `event_time` are always present; the type's own required fields follow it.",
+				"properties": {
+					"event_id": { "type": "string", "description": "32 lowercase hex, unique per project; the same on every re-delivery (the dedup key)." },
+					"type": { "type": "string", "enum": ["operation.started", "operation.finished", "step.started", "step.finished", "gap.reported"], "description": "The event's kind in the contract." },
+					"operation_id": { "type": "string", "description": "32 lowercase hex (W3C trace-id width)." },
+					"seq": { "type": "integer", "format": "int64", "description": "≥ 1, per source instance, in emission order; holes here are exact known gaps." },
+					"op_seq": { "type": "integer", "description": "≥ 1, per operation within the instance; `0` only on `gap.reported`." },
+					"event_time": { "type": "string", "format": "date-time", "description": "When the host says it happened (the second clock is the collector's receive time)." },
+					"name": { "type": "string", "description": "Required on `operation.started` and `step.started`." },
+					"trace_id": { "type": "string" },
+					"request_id": { "type": "string" },
+					"release": { "type": "string" },
+					"deployment": { "type": "string" },
+					"step_id": { "type": "string", "description": "16 lowercase hex; required on `step.*`." },
+					"parent_step_id": { "type": "string" },
+					"kind": { "type": "string", "enum": ["model", "tool", "job", "validation"], "description": "Required on `step.started`." },
+					"attempt": { "type": "integer", "description": "1–1000; required on `step.*`." },
+					"model": { "type": "string" },
+					"prompt_version": { "type": "string" },
+					"config_version": { "type": "string" },
+					"external_effect": { "type": "boolean", "description": "The step may cause an outside-world effect; an uncertain finish on it is flagged." },
+					"outcome": { "type": "string", "enum": ["succeeded", "failed", "uncertain"], "description": "Declared by the host, never inferred. Required on `operation.finished` and `step.finished`; `failed` takes `failure_class`, `uncertain` takes `uncertain_reason`." },
+					"failure_class": { "type": "string", "enum": ["transport", "rejected", "validation", "internal"] },
+					"uncertain_reason": { "type": "string", "enum": ["timeout_after_send", "connection_lost_after_send", "response_unreadable"] },
+					"error_code": { "type": "string" },
+					"error_message": { "type": "string", "description": "Free text; secret-shaped substrings are replaced with `[redacted]` and counted." },
+					"usage": { "type": "object", "properties": { "input_tokens": { "type": "integer" }, "output_tokens": { "type": "integer" } } },
+					"cost_estimate": { "type": "object", "description": "The host's cost estimate — labelled estimate, never a reconciled bill.", "properties": { "micros": { "type": "integer", "format": "int64" }, "currency": { "type": "string" }, "basis": { "type": "string" } } },
+					"events_emitted": { "type": "integer", "description": "Required on `operation.finished`: how many events the host emitted for the operation (≥ `op_seq`)." },
+					"dropped": { "type": "integer", "format": "int64", "description": "Required on `gap.reported`: how many events were dropped (≥ 1)." },
+					"reason": { "type": "string", "enum": ["queue_full", "send_failed", "rejected", "shutdown"], "description": "Required on `gap.reported`." },
+					"first_dropped_at": { "type": "string", "format": "date-time", "description": "Required on `gap.reported`." },
+					"last_dropped_at": { "type": "string", "format": "date-time", "description": "Required on `gap.reported`." },
+					"attributes": { "type": "object", "additionalProperties": true, "description": "Optional, ≤ 32 entries; policy-filtered on ingest — withheld counts, redactions and truncation stay visible." },
+					"truncated": { "type": "integer", "description": "How many string fields the sender cut to the caps." }
+				},
+				"required": ["event_id", "type", "operation_id", "seq", "op_seq", "event_time"]
+			},
+			"Batch": {
+				"type": "object",
+				"properties": {
+					"schema_version": { "type": "integer", "description": "The wire contract version. A mismatch refuses the whole batch." },
+					"source": { "$ref": "#/components/schemas/Source" },
+					"stats": { "$ref": "#/components/schemas/BatchStats" },
+					"events": { "type": "array", "items": { "$ref": "#/components/schemas/WireEvent" } }
+				},
+				"required": ["schema_version", "source", "events"]
+			},
+			"RefusedEvent": {
+				"type": "object",
+				"description": "One event the collector refused; the rest of the batch still went on.",
+				"properties": {
+					"index": { "type": "integer" },
+					"event_id": { "type": "string", "nullable": true },
+					"code": { "type": "string" },
+					"message": { "type": "string" }
+				},
+				"required": ["index", "code", "message"]
+			},
+			"IngestResponse": {
+				"type": "object",
+				"properties": {
+					"accepted": { "type": "integer", "description": "Newly stored events." },
+					"duplicates": { "type": "integer", "description": "Events already stored under the same `event_id` — idempotent resends, not new data." },
+					"refused": { "type": "array", "items": { "$ref": "#/components/schemas/RefusedEvent" } }
+				},
+				"required": ["accepted", "duplicates", "refused"]
+			},
+			"ProjectView": {
+				"type": "object",
+				"properties": { "slug": { "type": "string" } },
+				"required": ["slug"]
+			},
+			"ProjectsView": {
+				"type": "object",
+				"properties": {
+					"actor": { "type": "string" },
+					"scopes": { "type": "array", "items": { "type": "string", "enum": ["read", "operate", "admin"] } },
+					"projects": { "type": "array", "items": { "$ref": "#/components/schemas/ProjectView" } }
+				},
+				"required": ["actor", "scopes", "projects"]
+			},
+			"Status": {
+				"type": "object",
+				"description": "The declared status: what the host's `operation.finished` said. `no_finish_observed` means exactly that — no finish was observed; it is never rendered as \"running\" or \"did not run\".",
+				"properties": {
+					"state": { "type": "string", "enum": ["succeeded", "failed", "uncertain", "conflicting", "no_finish_observed"] },
+					"class": { "type": "string", "description": "The failure class when `state` is `failed`." },
+					"reason": { "type": "string", "description": "Why the outcome was uncertain." },
+					"code": { "type": "string" },
+					"declared": { "type": "boolean", "description": "Whether a finish event was observed at all." }
+				},
+				"required": ["state", "declared"]
+			},
+			"OperationSummary": {
+				"type": "object",
+				"properties": {
+					"operation_id": { "type": "string" },
+					"name": { "type": "string", "nullable": true },
+					"request_id": { "type": "string", "nullable": true },
+					"release": { "type": "string", "nullable": true },
+					"status": { "$ref": "#/components/schemas/Status" },
+					"first_event_time": { "type": "string", "format": "date-time" },
+					"last_event_time": { "type": "string", "format": "date-time" },
+					"last_received_at": { "type": "string", "format": "date-time" },
+					"events_received": { "type": "integer" },
+					"events_emitted": { "type": "integer", "nullable": true },
+					"events_missing": { "type": "integer", "nullable": true, "description": "`emitted - received` when the finish arrived; otherwise unknown — never guessed." },
+					"reported_dropped": { "type": "integer", "format": "int64" },
+					"failed_attempts": { "type": "integer" },
+					"uncertain_attempts": { "type": "integer" },
+					"cost_estimate_micros": { "type": "integer", "format": "int64" },
+					"cost_currency": { "type": "string", "nullable": true },
+					"detail_expired": { "type": "boolean", "description": "Raw events older than the retention cutoff may be deleted; the summary still stands." },
+					"multi_source": { "type": "boolean", "description": "Events came from several source instances; per-source completeness lives in the timeline." }
+				},
+				"required": ["operation_id", "status", "first_event_time", "last_event_time", "last_received_at", "events_received", "reported_dropped", "failed_attempts", "uncertain_attempts", "cost_estimate_micros", "detail_expired", "multi_source"]
+			},
+			"OperationList": {
+				"type": "object",
+				"properties": {
+					"operations": { "type": "array", "items": { "$ref": "#/components/schemas/OperationSummary" } },
+					"next": { "type": "array", "items": { "type": "string" }, "nullable": true, "description": "Pass back as `before_time`/`before_id` for the next page; absent at the end." }
+				},
+				"required": ["operations", "next"]
+			},
+			"Flags": {
+				"type": "object",
+				"properties": {
+					"failed_attempts": { "type": "integer" },
+					"uncertain_attempts": { "type": "integer" },
+					"retried_steps": { "type": "integer" },
+					"external_effect_unknown": { "type": "boolean", "description": "A step with `external_effect` finished uncertain or unobserved — an outside-world effect may have happened." },
+					"clock_skew_suspected": { "type": "boolean" },
+					"late_events": { "type": "integer" },
+					"conflicting_finish": { "type": "boolean" },
+					"start_not_observed": { "type": "boolean" },
+					"missing_events_may_hide_effects": { "type": "boolean" }
+				}
+			},
+			"InstanceCoverage": {
+				"type": "object",
+				"properties": {
+					"instance_id": { "type": "string" },
+					"emitted": { "type": "integer", "nullable": true },
+					"received": { "type": "integer" },
+					"missing_op_seq": { "type": "array", "items": { "type": "integer" }, "description": "Exact `op_seq` holes — known missing events." },
+					"missing_known": { "type": "integer" },
+					"tail_unknown": { "type": "boolean", "description": "The instance hasn't finished or gone silent after a declared end; what came after the last received event is unknown." }
+				},
+				"required": ["instance_id", "received", "missing_op_seq", "missing_known", "tail_unknown"]
+			},
+			"Coverage": {
+				"type": "object",
+				"properties": {
+					"events_received": { "type": "integer" },
+					"sdk_gap_reports": { "type": "integer" },
+					"reported_dropped": { "type": "integer", "format": "int64" },
+					"missing_known": { "type": "integer" },
+					"missing_unknown": { "type": "boolean", "description": "Loss is possible beyond the known holes (an unfinished tail, an unreported drop)." },
+					"expired": { "type": "integer" },
+					"per_instance": { "type": "array", "items": { "$ref": "#/components/schemas/InstanceCoverage" } }
+				},
+				"required": ["events_received", "sdk_gap_reports", "reported_dropped", "missing_known", "missing_unknown", "expired", "per_instance"]
+			},
+			"CostView": {
+				"type": "object",
+				"description": "Always an estimate, never a reconciled bill — the label is part of the payload.",
+				"properties": {
+					"label": { "type": "string" },
+					"estimate_micros": { "type": "integer", "format": "int64" },
+					"currency": { "type": "string", "nullable": true },
+					"mixed_currencies": { "type": "boolean" },
+					"attempts_with_estimate": { "type": "integer" },
+					"input_tokens": { "type": "integer", "format": "int64" },
+					"output_tokens": { "type": "integer", "format": "int64" }
+				}
+			},
+			"AttrView": {
+				"type": "object",
+				"properties": {
+					"key": { "type": "string" },
+					"value": {},
+					"opt_in": { "type": "boolean", "description": "Included only because the project opted this key in." }
+				},
+				"required": ["key", "opt_in"]
+			},
+			"EntryView": {
+				"type": "object",
+				"description": "One stored event as the timeline renders it, with both clocks.",
+				"properties": {
+					"event_id": { "type": "string" },
+					"event_type": { "type": "string" },
+					"instance_id": { "type": "string" },
+					"ingest_key": { "type": "string" },
+					"seq": { "type": "integer", "format": "int64" },
+					"op_seq": { "type": "integer" },
+					"event_time": { "type": "string", "format": "date-time" },
+					"received_at": { "type": "string", "format": "date-time" },
+					"receive_delay_us": { "type": "integer", "format": "int64" },
+					"flags": { "type": "array", "items": { "type": "string" } },
+					"step_id": { "type": "string", "nullable": true },
+					"attempt": { "type": "integer", "nullable": true },
+					"kind": { "type": "string", "nullable": true },
+					"name": { "type": "string", "nullable": true },
+					"outcome": { "$ref": "#/components/schemas/Status" },
+					"dropped": { "type": "integer", "format": "int64", "nullable": true },
+					"reason": { "type": "string", "nullable": true },
+					"attributes": { "type": "array", "items": { "$ref": "#/components/schemas/AttrView" } },
+					"withheld_attributes": { "type": "integer" },
+					"redactions": { "type": "integer" },
+					"overflowed_names": { "type": "integer" },
+					"truncated": { "type": "integer" }
+				},
+				"required": ["event_id", "event_type", "instance_id", "ingest_key", "seq", "op_seq", "event_time", "received_at", "receive_delay_us", "flags", "attributes", "withheld_attributes", "redactions", "overflowed_names", "truncated"]
+			},
+			"AttemptView": {
+				"type": "object",
+				"properties": {
+					"attempt": { "type": "integer" },
+					"state": { "type": "string", "enum": ["succeeded", "failed", "uncertain", "no_finish_observed"] },
+					"class": { "type": "string" },
+					"reason": { "type": "string" },
+					"start_observed": { "type": "boolean" },
+					"finish_observed": { "type": "boolean" },
+					"started_at": { "type": "string", "format": "date-time" },
+					"finished_at": { "type": "string", "format": "date-time" },
+					"duration_us": { "type": "integer", "format": "int64" },
+					"model": { "type": "string" },
+					"prompt_version": { "type": "string" },
+					"config_version": { "type": "string" },
+					"error_code": { "type": "string" },
+					"error_message": { "type": "string" },
+					"input_tokens": { "type": "integer", "format": "int64" },
+					"output_tokens": { "type": "integer", "format": "int64" },
+					"cost_estimate_micros": { "type": "integer", "format": "int64" },
+					"external_effect": { "type": "boolean" },
+					"usage_unknown": { "type": "boolean" }
+				},
+				"required": ["attempt", "state", "start_observed", "finish_observed"]
+			},
+			"StepView": {
+				"type": "object",
+				"properties": {
+					"step_id": { "type": "string" },
+					"parent_step_id": { "type": "string", "nullable": true },
+					"kind": { "type": "string" },
+					"name": { "type": "string", "nullable": true },
+					"attempts": { "type": "array", "items": { "$ref": "#/components/schemas/AttemptView" } },
+					"external_effect": { "type": "boolean" },
+					"effect_unknown": { "type": "boolean" }
+				},
+				"required": ["step_id", "attempts"]
+			},
+			"GapView": {
+				"type": "object",
+				"description": "A stretch the timeline knows it's missing.",
+				"properties": {
+					"kind": { "type": "string" },
+					"op_seq_from": { "type": "integer" },
+					"op_seq_to": { "type": "integer" },
+					"events": { "type": "integer" }
+				}
+			},
+			"SourceView": {
+				"type": "object",
+				"properties": {
+					"instance_id": { "type": "string" },
+					"service": { "type": "string" },
+					"sdk": { "type": "string" },
+					"ingest_key": { "type": "string" },
+					"first_seen": { "type": "string", "format": "date-time" },
+					"last_seen": { "type": "string", "format": "date-time" },
+					"events_received": { "type": "integer" },
+					"events_refused": { "type": "integer" }
+				}
+			},
+			"Timeline": {
+				"type": "object",
+				"description": "One operation's correlated record: declared status, flags, coverage, steps, entries, gaps, sources and retention state.",
+				"properties": {
+					"operation_id": { "type": "string" },
+					"name": { "type": "string", "nullable": true },
+					"request_id": { "type": "string", "nullable": true },
+					"trace_id": { "type": "string", "nullable": true },
+					"release": { "type": "string", "nullable": true },
+					"deployment": { "type": "string", "nullable": true },
+					"status": { "$ref": "#/components/schemas/Status" },
+					"flags": { "$ref": "#/components/schemas/Flags" },
+					"coverage": { "$ref": "#/components/schemas/Coverage" },
+					"cost": { "$ref": "#/components/schemas/CostView" },
+					"steps": { "type": "array", "items": { "$ref": "#/components/schemas/StepView" } },
+					"entries": { "type": "array", "items": { "$ref": "#/components/schemas/EntryView" } },
+					"gaps": { "type": "array", "items": { "$ref": "#/components/schemas/GapView" } },
+					"sources": { "type": "array", "items": { "$ref": "#/components/schemas/SourceView" } },
+					"effect_unknown_steps": { "type": "array", "items": { "type": "string" }, "description": "Step ids whose uncertain or unobserved finish may hide an outside-world effect." },
+					"expired_by_retention": { "type": "integer", "description": "Stored events deleted by retention; their place in the timeline is still shown." },
+					"retention_cutoff": { "type": "string", "format": "date-time", "nullable": true },
+					"events_truncated": { "type": "boolean" }
+				},
+				"required": ["operation_id", "status", "flags", "coverage", "cost", "steps", "entries", "gaps", "sources", "effect_unknown_steps", "expired_by_retention", "events_truncated"]
+			},
+			"ReleaseView": {
+				"type": "object",
+				"properties": {
+					"release": { "type": "string" },
+					"operations": { "type": "integer", "format": "int64" },
+					"succeeded": { "type": "integer", "format": "int64" },
+					"failed": { "type": "integer", "format": "int64" },
+					"uncertain": { "type": "integer", "format": "int64" },
+					"conflicting": { "type": "integer", "format": "int64" },
+					"no_finish_observed": { "type": "integer", "format": "int64" },
+					"missing_events": { "type": "integer", "format": "int64" },
+					"reported_dropped": { "type": "integer", "format": "int64" },
+					"failed_attempts": { "type": "integer", "format": "int64" },
+					"uncertain_attempts": { "type": "integer", "format": "int64" },
+					"cost_estimate_micros": { "type": "integer", "format": "int64", "nullable": true },
+					"mixed_currencies": { "type": "boolean" }
+				},
+				"required": ["release", "operations", "succeeded", "failed", "uncertain", "conflicting", "no_finish_observed", "missing_events", "reported_dropped", "failed_attempts", "uncertain_attempts", "mixed_currencies"]
+			},
+			"Comparison": {
+				"type": "object",
+				"properties": {
+					"from": { "type": "string", "format": "date-time" },
+					"to": { "type": "string", "format": "date-time" },
+					"releases": { "type": "array", "items": { "$ref": "#/components/schemas/ReleaseView" } }
+				},
+				"required": ["from", "to", "releases"]
+			},
+			"LockView": {
+				"type": "object",
+				"description": "Wait and hold-time counters for one in-process lock.",
+				"additionalProperties": { "type": "integer", "format": "int64" }
+			},
+			"LocksView": {
+				"type": "object",
+				"properties": {
+					"names_map": { "$ref": "#/components/schemas/LockView" },
+					"names_shared": { "$ref": "#/components/schemas/LockView" },
+					"names_exclusive": { "$ref": "#/components/schemas/LockView" },
+					"ingest_key_cache": { "$ref": "#/components/schemas/LockView" },
+					"ingest_rate_limit": { "$ref": "#/components/schemas/LockView" },
+					"token_cache": { "$ref": "#/components/schemas/LockView" },
+					"query_rate_limit": { "$ref": "#/components/schemas/LockView" },
+					"project_cache": { "$ref": "#/components/schemas/LockView" }
+				}
+			},
+			"MetricsView": {
+				"type": "object",
+				"properties": {
+					"batches": { "type": "integer", "format": "int64" },
+					"events_accepted": { "type": "integer", "format": "int64" },
+					"events_duplicate": { "type": "integer", "format": "int64" },
+					"events_refused": { "type": "integer", "format": "int64" },
+					"events_conflicting": { "type": "integer", "format": "int64" },
+					"attributes_withheld": { "type": "integer", "format": "int64" },
+					"redactions": { "type": "integer", "format": "int64" },
+					"unauthenticated": { "type": "integer", "format": "int64" },
+					"shed": { "type": "integer", "format": "int64" },
+					"rate_limited": { "type": "integer", "format": "int64" },
+					"denied": { "type": "integer", "format": "int64" },
+					"store_unavailable": { "type": "integer", "format": "int64" },
+					"auth_shed": { "type": "integer", "format": "int64" },
+					"locks": { "$ref": "#/components/schemas/LocksView" }
+				},
+				"required": ["batches", "events_accepted", "events_duplicate", "events_refused", "events_conflicting", "attributes_withheld", "redactions", "unauthenticated", "shed", "rate_limited", "denied", "store_unavailable", "auth_shed", "locks"]
+			},
+			"RunView": {
+				"type": "object",
+				"description": "The runner's own answer, verbatim — never re-derived from telemetry.",
+				"properties": {
+					"state": { "type": "string" },
+					"key": { "type": "string" },
+					"steps": { "type": "integer" },
+					"finished_at_ms": { "type": "integer", "format": "int64", "nullable": true }
+				},
+				"required": ["state", "key", "steps", "finished_at_ms"]
+			},
+			"Authority": {
+				"description": "One of six explicit states, tagged by `state`. `unavailable` means the authority could not be asked or answered usably — nothing is inferred in its place.",
+				"oneOf": [
+					{ "type": "object", "properties": { "state": { "const": "not_configured" } }, "required": ["state"] },
+					{ "type": "object", "properties": { "state": { "const": "not_linked" } }, "required": ["state"] },
+					{ "type": "object", "properties": { "state": { "const": "unknown_runner" }, "runner": { "type": "string" } }, "required": ["state", "runner"] },
+					{ "type": "object", "properties": { "state": { "const": "link_unverified" }, "runner": { "type": "string" }, "run_id": { "type": "integer", "format": "int64" } }, "required": ["state", "runner", "run_id"] },
+					{ "type": "object", "properties": { "state": { "const": "unavailable" }, "source": { "type": "string" }, "runner": { "type": "string" }, "run_id": { "type": "integer", "format": "int64" }, "reason": { "type": "string" }, "read_at": { "type": "string", "format": "date-time" } }, "required": ["state", "source", "runner", "run_id", "reason", "read_at"] },
+					{ "type": "object", "properties": { "state": { "const": "answered" }, "source": { "type": "string" }, "runner": { "type": "string" }, "run_id": { "type": "integer", "format": "int64" }, "read_at": { "type": "string", "format": "date-time" }, "answer": { "$ref": "#/components/schemas/RunView" } }, "required": ["state", "source", "runner", "run_id", "read_at", "answer"] }
+				]
+			}
+		}
+	}
+}

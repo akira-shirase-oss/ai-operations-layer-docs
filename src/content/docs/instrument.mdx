@@ -1,0 +1,78 @@
+---
+title: The Rust SDK
+description: Emit operations, steps and gap reports from Rust code — bounded, non-blocking, and honest about loss.
+---
+
+`aiops-sdk` is the crate your host service emits through. Everything on this page runs on your machine
+against a local collector (`AIOPS_ENDPOINT` defaults to `http://127.0.0.1:57400`).
+
+Its guarantees are the point:
+
+- **Never blocks the request path beyond its bound.** Emitting is a non-blocking enqueue into a
+  bounded queue; a full queue **drops and counts**.
+- **Never panics.** Calls return `Result`; the SDK — and your service — keep working when the
+  collector is down.
+- **Every drop is counted** and every counter is exposable to the host; `stats` ride on every batch
+  so the latest cumulative values survive lost batches.
+- **Context propagation** follows OTel-compatible formats; event payloads conform to the versioned
+  [ingest contract](/ingest-contract/) — no schema drift without a version bump.
+- **Server-side only.** An ingest key in a browser is a published key.
+
+## Add it and emit an operation
+
+```toml not-run="a Cargo.toml fragment, not a command"
+[dependencies]
+aiops-sdk = { path = "../ai-operations-layer/crates/aiops-sdk" }
+```
+
+The SDK reads its endpoint and key from the environment the collector gave you:
+
+```sh run=sdk step=sdk-env not-run="todo: wire the sdk suite to a built reference example"
+export AIOPS_ENDPOINT=http://127.0.0.1:57400
+export AIOPS_INGEST_KEY=aiops_ik_…   # from admin create-ingest-key
+```
+
+```rust not-run="a Rust example compiled by the product's own test suite (crates/aiops-sdk/examples)"
+use aiops_sdk::{Client, ClientConfig, Step};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = Client::new(ClientConfig::from_env()?)?;
+
+    // One operation: ids and op_seq are managed for you; finishes are declared, not inferred.
+    let op = client.operation("checkout.answer")
+        .release("2026.46")
+        .start()?;
+
+    let step = op.step(Step::model("draft-reply").model_name("acme-small-4")).start()?;
+    // … call the model …
+    step.finish_succeeded()
+        .usage(812, 144)
+        .cost_estimate_micros(91_000, "USD", "price-card-2026-10")
+        .await?;
+
+    op.finish_succeeded().await?;   // declares events_emitted so coverage can count
+    client.shutdown().await?;       // flushes what the queue holds, then stops
+    Ok(())
+}
+```
+
+If the collector is unreachable, `finish_*` calls still succeed — events sit in the bounded queue and
+are flushed when it recovers; if the queue overflows, `dropped_queue_full` rises and the next batch's
+`stats` reports it, so the loss is visible in the console rather than silent.
+
+## What to read on the wire
+
+Every event the SDK emits is the contract from [the ingest contract](/ingest-contract/): dotted
+`type`s, per-instance `seq`, per-operation `op_seq`, `event_id` as the dedup key, `event_time` on the
+wire and `received_at` added by the collector.
+
+## Marking effects and uncertainty
+
+A step that may change the outside world — charge a card, send an email, merge a PR — should be
+declared with `external_effect`, and a request that left the host without a usable answer finishes
+`uncertain` with one of the three reasons. The timeline then flags it: *the effect may have happened*.
+That is the honest state to act on — check the authoritative store, don't blindly retry.
+
+See the runnable example in the product repository at `crates/aiops-sdk/examples/first_operation.rs`,
+which this SDK's own tests exercise end-to-end.

@@ -1,0 +1,41 @@
+---
+title: Errors
+description: The single error shape every route returns, and the codes to branch on.
+---
+
+Every route — probes aside — returns the same error shape, so a client needs one code path:
+
+```json not-run="the error shape"
+{"code": "project_not_in_scope", "message": "the token's projects do not include docs"}
+```
+
+HTTP status carries the class; `code` carries the machine-readable cause; `message` is for humans.
+Refusals and rate limits are errors of the same shape — `409` and `503` are *readable refusals*, never
+pretend successes.
+
+## Statuses to branch on
+
+| Status | Meaning | Do |
+|---|---|---|
+| `400` | Bad input: `malformed_batch`, `unsupported_schema_version`, `invalid_source`, or a bad query parameter (`status`, `from`, `to`, overlong identifier) | Fix the request; retrying unchanged won't help. |
+| `401` | `unauthenticated` — missing or bad credential | Re-check the header; mint a new key/token. |
+| `403` | `project_not_in_scope`, `forbidden` — the credential works, just not for this | Check the token's projects/scopes via `GET /v1/projects`. |
+| `404` | `not_found` — no such operation in this project | It's absent or expired; check the id and `detail_expired`. |
+| `409` | A refusal with a code: `instance_owned_by_another_key` and control-path refusals | Read `code`; it names the conflict. |
+| `413` | `payload_too_large`, `too_many_events` | Split the batch; see [bounds](/ingest-contract/#bounds-and-the-answers-they-get). |
+| `429` | `rate_limited` | Wait `Retry-After` seconds and retry — the header is always present. |
+| `503` | `overloaded` (shed load, auth-lookup budget spent, body budget spent) or `store_unavailable` | Back off and retry; `overloaded` answers before any body byte is read. |
+
+## Per-event refusals
+
+Inside a `200` ingest response, `refused[]` entries carry `{index, event_id?, code, message}` —
+`unknown_event_type`, `invalid_id`, `missing_field`, `field_not_allowed`, `attribute_key`,
+`attribute_value`, `event_too_large`, `time_out_of_range`, and friends. The event at that index was not
+stored; the rest of the batch still stands. Your SDK's `dropped_rejected` counter should rise when you
+see these.
+
+## What is *not* an error
+
+`no_finish_observed`, `missing_op_seq`, `tail_unknown`, `detail_expired`, `unavailable` authority —
+these are data states the API returns inside `200` responses, because they're facts about the
+telemetry, not failures of the request. Render them; don't catch them.

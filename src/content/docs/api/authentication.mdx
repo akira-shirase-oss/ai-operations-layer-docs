@@ -1,0 +1,81 @@
+---
+title: Authentication and keys
+description: "Ingest keys vs. API tokens — who mints them, what they authorize, how they're stored, cached and revoked."
+---
+
+{/* snippet api: snippets/restart.sh */}
+
+Two credential kinds, kept strictly apart because they do different jobs:
+
+## Ingest keys (`aiops_ik_…`)
+
+Authorize **only** `POST /v1/ingest`, for one project, named for the host that holds it:
+
+```sh run=api
+./target/release/aiops-server admin create-ingest-key --project docs --name web-1
+```
+
+```text output=api
+aiops_ik_<key>
+```
+
+Send it as `Authorization: Bearer`. The body is read **only after the key authenticates from the
+headers** — an unknown key never gets to spend ingest capacity. Key lookups are budgeted (a few
+parallel lookups on their own connections; beyond that, `503 overloaded` without a query), valid and
+invalid keys are cached separately, and **a revoked key stops working within 30 seconds** (the
+valid-cache lifetime — up to 5 min 30 s while the lookup budget is exhausted).
+
+A source `instance_id` belongs to the first key that used it; another key claiming it is refused
+`409 instance_owned_by_another_key` — one host can't write into another's gaps.
+
+## API tokens (`aiops_tk_…`)
+
+Authorize the query routes. A token carries an **actor**, a list of **projects** it may see, and
+**scopes**:
+
+```sh run=api
+./target/release/aiops-server admin create-token --actor sam --project docs --scope read --ttl-days 30
+```
+
+```text output=api
+aiops_tk_<token>
+```
+
+- `read` — projects, operations list, timelines, release comparisons, authority reads.
+- `operate` — control-plane actions where they exist.
+- `admin` — additionally `GET /v1/collector/stats` and administrative routes.
+
+`GET /v1/projects` echoes back who the token is, which is the cheapest way to test a new one:
+
+```sh run=api
+curl -s https://aiops.example.com/v1/projects -H "Authorization: Bearer $AIOPS_TOKEN"
+```
+
+```json output=api
+{"actor":"docs","scopes":["read"],"projects":[{"slug":"docs"}]}
+```
+
+Both credential kinds are **printed once** at minting; the store keeps only their hashes, so a leaked
+database backup doesn't leak usable keys, and neither can be retrieved later — rotate instead.
+
+## Revoking and rotating
+
+```sh run=api
+./target/release/aiops-server admin create-ingest-key --project docs --name web-2   # mint the replacement first
+./target/release/aiops-server admin revoke-ingest-key --project docs --name web-1   # then retire the old
+```
+
+```text output=api
+aiops_ik_<key>
+revoked ingest key web-1 of docs
+```
+
+Tokens revoke by id (the `token <id> for <actor>` line printed at minting, on stderr):
+
+```sh not-run="the id comes from create-token's stderr line — revoke by that id"
+./target/release/aiops-server admin revoke-token <token-id>
+```
+
+The console keeps its token only in the tab's `sessionStorage`; a tab close is a logout. For
+applications, prefer short `ttl-days` and rotation over long-lived tokens, and never put an ingest key
+in a browser — that publishes it.

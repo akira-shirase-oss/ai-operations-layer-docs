@@ -1,0 +1,78 @@
+---
+title: Concepts
+description: "The model every page assumes: operations, declared outcomes, the two clocks, gaps as data, and telemetry that is never authority."
+---
+
+The AI Operations Layer is built on a small number of commitments. Once they click, every screen and
+every API field makes sense.
+
+## Operations and declared outcomes
+
+An **operation** is one unit of work in your host service: a request, a run, a task. The host emits
+`operation.started` when it begins and `operation.finished` when it ends — and the outcome on that
+finish is **declared by the host, never inferred by the collector**.
+
+If no finish was observed, the status is `no_finish_observed`. That is a precise statement — *no finish
+event arrived* — not "running" (the host may have finished without us hearing) and not "did not run"
+(the events may just be late). A status of `conflicting` means two finishes arrived that disagree, and
+both are kept.
+
+`failed` carries a `failure_class` (`transport`, `rejected`, `validation`, `internal`); `uncertain`
+carries an `uncertain_reason` — `timeout_after_send`, `connection_lost_after_send` or
+`response_unreadable`, which all mean *the request left the host; the effect may have happened*. A
+cancelled run is declared `failed` with `error_code: cancelled` — visible as cancelled, never as a host
+error and never inferred.
+
+## Steps, attempts and effects
+
+Inside an operation, steps are `model`, `tool`, `job` or `validation`, each with attempts. A step
+declared `external_effect: true` may cause an outside-world effect. When such a step finishes
+`uncertain` — or its finish never arrives — the timeline flags it: **an outside effect may have
+happened and telemetry cannot tell you whether it did.** That flag (`effect_unknown_steps`,
+`external_effect_unknown`) is a prompt to check the authoritative store, never a verdict.
+
+## Two clocks, no fabricated chronology
+
+Every event carries `event_time` — when the host says it happened — and is stored with `received_at` —
+when the collector got it. The gap between them (`receive_delay_us`) is shown per event. Late events
+merge idempotently into the right place; clock skew is flagged (`clock_skew_suspected`) rather than
+corrected, because reordering to hide skew would fabricate a chronology nobody observed.
+
+## Gaps are data
+
+Loss is shown, with counts:
+
+- `op_seq` holes are **known missing events** — exact ranges the host numbered and we never received.
+- `seq` holes per source instance show lost batches.
+- The SDK reports its own drops (`gap.reported` events and per-batch `stats`), so a full queue or a
+  dead collector is visible as loss it *knows about*.
+- An unfinished instance leaves an **unknown tail**: what happened after the last received event is
+  `missing_unknown` — possible loss we cannot bound, never rounded to zero.
+- Collector refusals stay attached to the batch that caused them.
+
+## Estimates, never bills
+
+Cost figures are labelled estimates (`cost_estimate` with `micros`, `currency`, `basis`). They are
+stored and shown separately from billing, summed as estimates in lists and comparisons, and marked
+`mixed_currencies` when the inputs disagree. Nothing here is a reconciled bill.
+
+## Telemetry is not authority
+
+Reading a timeline never touches authority. For an operation backed by an execution authority (today:
+a Durable Runner deployment), `GET …/authority` asks the authority **live** — after verifying the named
+run really derives to this operation — and returns one of six explicit states: `answered`,
+`not_configured`, `not_linked`, `unknown_runner`, `link_unverified`, `unavailable`. An unreachable
+authority is `unavailable`, never silently replaced by a telemetry guess.
+
+## Privacy by default
+
+No prompts, customer content, tokens or secrets in default metadata. Attributes pass a policy filter on
+ingest: non-opt-in keys are withheld (`withheld_attributes`), secret-shaped values are replaced with
+`[redacted]` and counted, oversized values truncate and count. Opt-in is per-key per project via
+`admin set-opt-in`. An event's `error_message` is free text — render it as text, never HTML.
+
+## Retention
+
+Raw events expire on a schedule (`expired_by_retention`, `retention_cutoff` on the timeline). Summaries
+survive: a list still shows the operation and its declared status, marked `detail_expired` — the
+summary stands while the detail is gone.

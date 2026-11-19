@@ -1,0 +1,46 @@
+---
+title: Deployment
+description: One binary, one Postgres, one origin — the deployment shape, and the migration order that keeps it safe.
+---
+
+The deployable unit is a single `aiops-server` binary: collector, API, admin CLI and console statics
+together, behind a TLS-terminating proxy (the product's reference setup runs under systemd behind
+Caddy on a small droplet, with Postgres on a managed service using `sslmode=verify-full`).
+
+## The shape
+
+```text not-run="a topology, not a command"
+            ┌──────────┐      ┌──────────────┐      ┌────────────┐
+ browsers → │  proxy   │  →   │ aiops-server │  →   │ PostgreSQL │
+ SDKs ────→ │ (TLS)    │      │ :57400       │      │            │
+            └──────────┘      │  /v1/*       │      └────────────┘
+                              │  /console/   │
+                              └──────────────┘
+```
+
+One origin serves API and console — no CORS, no second deploy.
+
+## Order of operations
+
+1. **Migrate first**: `AIOPS_DATABASE_URL=… aiops-server migrate` — migrations are forward-only
+   schema changes; run them before starting new binaries.
+2. **Start the new binary**; gate traffic on `/readyz` (200 only when the store answers).
+3. Mint an ingest key per host and a read token per console user — see [the admin CLI](/cli/).
+
+```sh not-run="a systemd unit file, not a shell command"
+# /etc/systemd/system/aiops.service — the shape the reference deploy uses
+[Service]
+Environment=AIOPS_DATABASE_URL=postgres://…
+Environment=AIOPS_LISTEN=127.0.0.1:57400
+ExecStart=/usr/local/bin/aiops-server serve
+Restart=on-failure
+```
+
+The collector binds loopback by default (`127.0.0.1:57400`); the proxy owns the public edge, so the
+binary never faces raw internet traffic.
+
+## Upgrades
+
+Backward-compatible: migrate, roll binaries behind `/readyz`. In-flight batches may duplicate on a
+mid-upload restart — `event_id` dedup makes that free. Old SDKs keep working within the same
+`schema_version`; a version bump is a deliberate, documented change, never drift.

@@ -1,0 +1,43 @@
+---
+title: Configuration
+description: Every environment variable aiops-server reads, its default, and what it bounds. Examples below run on this machine.
+---
+
+All configuration is environment variables; there are no config files. The defaults are the
+development loopback set — production changes three things: `AIOPS_LISTEN`, `AIOPS_DATABASE_URL`, and
+the bounds for your load.
+
+## Required
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AIOPS_DATABASE_URL` | — (required) | PostgreSQL the collector stores in. Needed by `serve`, `migrate` and every `admin` command. |
+
+## The server
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `AIOPS_LISTEN` | `127.0.0.1:57400` | Collector + API + console listen address. |
+
+## The bounds
+
+These are the levers the ingest contract enforces — see [the ingest contract](/ingest-contract/) for
+the answers each bound gives when exceeded.
+
+| Variable | Default | Bounds |
+|---|---|---|
+| `AIOPS_INGEST_BODY_BUDGET_MIB` | 32 | Event-body bytes held in flight at once. |
+| `AIOPS_AUTH_LOOKUPS` | 4 | Parallel uncached credential lookups. |
+| `AIOPS_INGEST_RATE` / `AIOPS_INGEST_BURST` | per-key limits | Token bucket per ingest key. |
+| `AIOPS_QUERY_RATE` / `AIOPS_QUERY_BURST` | per-token limits | Token bucket per API token. |
+| `AIOPS_RAW_RETENTION_DAYS` | retention window | Raw events expire past it; summaries survive. |
+| `AIOPS_AUTHORITY_URL` | unset | The execution authority's API origin (Durable Runner). Unset → authority reads return `not_configured`. |
+
+## The SDK's side
+
+The SDK reads `AIOPS_ENDPOINT` (the collector origin, default `http://127.0.0.1:57400`) and
+`AIOPS_INGEST_KEY` — the key belongs on the host that emits, never in a browser.
+
+Exact variable names and defaults for your version are in the product repository's
+`crates/aiops-server/src/config.rs` — the names above are stable, the numeric defaults are documented
+there with their decision records.

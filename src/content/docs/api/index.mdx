@@ -1,0 +1,76 @@
+---
+title: Which API, when
+description: The two credential kinds and the three kinds of routes — probes, ingest, query — and which to reach for.
+---
+
+Hosted examples on this page use `https://aiops.example.com` — substitute your collector's origin.
+
+{/* snippet api: snippets/restart.sh */}
+
+## The two credentials, in one line
+
+| Credential | Minted by | Authorizes |
+|---|---|---|
+| **Ingest key** `aiops_ik_…` | `admin create-ingest-key --project P --name HOST` | `POST /v1/ingest` only |
+| **API token** `aiops_tk_…` | `admin create-token --actor A --project P --scope read\|operate\|admin` | The query routes, within its projects and scopes |
+
+Details: [Authentication and keys](/api/authentication/).
+
+## Probes — no credential
+
+| Route | Use it for |
+|---|---|
+| `GET /healthz` | "Is the process up?" — container liveness. Never touches the store. |
+| `GET /readyz` | "Can it serve?" — 200 only when PostgreSQL answers within a second; else 503. The load balancer's signal. |
+
+```sh run=api
+curl -s https://aiops.example.com/readyz
+```
+
+```json output=api
+{"ready":true,"store":"reachable"}
+```
+
+## Ingest — one route, by design
+
+`POST /v1/ingest` is the only write path and it takes batches, not single events. Reach for it from the
+SDK (which batches for you) or directly when you hand-roll emission:
+
+```sh run=api
+curl -s https://aiops.example.com/v1/ingest \
+  -H "Authorization: Bearer $AIOPS_INGEST_KEY" -H "Content-Type: application/json" \
+  -d '{"schema_version":1,"source":{"instance_id":"a1b2c3d4e5f60718293a4b5c6d7e8f90","service":"checkout","sdk":"curl/0"},"stats":{"dropped_queue_full":0,"dropped_send_failed":0,"dropped_rejected":0,"gap_overflow":0,"truncated_events":0},"events":[{"event_id":"77777777777777777777777777777777","type":"operation.started","operation_id":"88888888888888888888888888888888","seq":1,"op_seq":1,"event_time":"2026-11-17T12:00:00Z","name":"api.demo"}]}'
+```
+
+```json output=api
+{"accepted":1,"duplicates":0,"refused":[]}
+```
+
+The response's three counters are the contract: `accepted` stored new, `duplicates` idempotent resends,
+`refused` per-event rejections with codes — never a silent drop. Rules: [the ingest contract](/ingest-contract/).
+
+## Query — what the console uses
+
+| You want… | Route | Scope |
+|---|---|---|
+| "Who am I, what can I see?" | `GET /v1/projects` | read |
+| Recent operations, filtered | `GET /v1/projects/{p}/operations` | read |
+| One operation, full record | `GET /v1/projects/{p}/operations/{id}` | read |
+| What the runner says about it | `GET /v1/projects/{p}/operations/{id}/authority` | read |
+| Releases side by side | `GET /v1/projects/{p}/releases/compare?releases=a,b` | read |
+| The collector's own counters | `GET /v1/collector/stats` | admin |
+
+```sh run=api
+curl -s "https://aiops.example.com/v1/projects/docs/operations?limit=1" \
+  -H "Authorization: Bearer $AIOPS_TOKEN"
+```
+
+Choosing between them: **list** for breadth ("what failed overnight?", "which operations are
+`uncertain`?"), **timeline** for depth on one operation, **authority** when the question is "what does
+the system of record say?" — because telemetry never answers that by itself.
+
+## Errors
+
+Every route returns the same error shape — `{"code","message"}` — with refusals and rate limits
+carrying structured codes. The catalogue: [Errors](/errors/). The full schema and a try-it client:
+[API reference](/api/reference/).

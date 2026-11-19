@@ -1,0 +1,33 @@
+---
+title: Capacity
+description: What the collector spends, what it sheds first, and how to size for your event rate.
+---
+
+The collector is built to degrade honestly: every resource is bounded, the bounds are counted, and
+overload sheds load **before** it touches the expensive path.
+
+## Where capacity goes
+
+| Resource | Bound | When it's spent |
+|---|---|---|
+| Ingest body bytes in flight | `AIOPS_INGEST_BODY_BUDGET_MIB` (32 MiB) | Bodies being read right now. Charged on `Content-Length` before a byte is read; over budget → `503 overloaded`. |
+| Uncached credential lookups | `AIOPS_AUTH_LOOKUPS` (4) | Unknown keys hit a few parallel DB lookups; over budget → `503 overloaded` with no query spent. A flood of fake keys can't starve real hosts. |
+| Per-key ingest rate | token bucket | Sustained ingest per key; over → `429 rate_limited` + `Retry-After`. |
+| Per-token query rate | token bucket | Query/API reads per token; over → `429`. |
+| Event size / batch size | 8 KiB / 500 events | Per-event `413 event_too_large`; per-batch `413 too_many_events`. |
+
+## What to watch
+
+`GET /v1/collector/stats` (admin scope) exposes the counters that tell you which bound is biting:
+`shed`, `rate_limited`, `auth_shed`, `events_refused`, `store_unavailable`, plus lock wait/hold times
+for the internal registries — the early-warning signals before users feel it.
+
+## Sizing guidance
+
+- **PostgreSQL is the bottleneck for reads and writes.** The collector keeps hot data in memory
+  (name registries, credential caches, rate buckets) precisely so steady-state traffic doesn't hit
+  the store. Size the database for your *event ingest rate*, not your dashboard traffic.
+- **Horizontal state:** the in-memory registries and rate buckets are per-process — the reference
+  shape is one collector per store, and the counters in `stats` are per-process truth.
+- **Load numbers live in the product repository** (`perf/results/`), measured on the recorded machine
+  and commit — treat them as evidence with a provenance, not a promise for your hardware.

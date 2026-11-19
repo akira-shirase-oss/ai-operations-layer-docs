@@ -1,0 +1,38 @@
+---
+title: Security
+description: "What the collector assumes about its environment, what it protects, and the lines it doesn't cross."
+---
+
+## The deployment assumptions
+
+- The collector binds **loopback by default** (`127.0.0.1:57400`). A TLS-terminating proxy owns the
+  public edge; the binary is not built to face raw internet traffic.
+- The console is same-origin — no CORS surface, tokens never cross origins.
+- PostgreSQL is the only dependency; connect with `sslmode=verify-full` to managed Postgres.
+
+## What it protects, by construction
+
+- **Credentials are hashed at rest.** Ingest keys and API tokens print once at minting; the store
+  keeps hashes. A database leak doesn't yield usable keys.
+- **Ingest bodies are read only after authentication** — an unknown key never spends body budget or
+  query capacity, and lookup concurrency is bounded so a flood of fake keys can't starve real hosts.
+- **Instance pinning.** A source `instance_id` belongs to its first ingest key; another key claiming
+  it is refused `409 instance_owned_by_another_key` — one stolen key can't forge another host's
+  history or fill its gaps.
+- **Default-deny metadata.** No prompts, content or secrets in default attributes; extra keys are
+  opt-in per project (`admin set-opt-in`), withheld counts are stored, and secret-shaped substrings in
+  `error_message` are replaced with `[redacted]` and counted.
+- **Bounded everything.** Body, batch, rate and lookup limits are in
+  [the ingest contract](/ingest-contract/) and [Capacity](/self-hosting/capacity/).
+- **The audit trail.** Token mints/revokes and control-path actions write audit rows — who, what, when.
+
+## The lines it doesn't cross
+
+- Telemetry is **evidence, not authority**: nothing the API returns authorizes a retry, refund or
+  publication. Build your business checks on the system of record (e.g. Durable Runner), which the
+  authority route reads live and verifies.
+- `error_message` is free text and attacker-influenced: **render it as text, never HTML** — the
+  console does, under its CSP.
+- An ingest key in a browser is a published key — SDK emission is server-side only.
+- The API reference page in these docs runs requests only to the server you choose and keeps no token
+  after reload — the same rule the console follows (`sessionStorage` only).

@@ -1,0 +1,87 @@
+---
+title: The ingest contract
+description: The versioned wire format — batch shape, event fields, per-type rules, bounds, and every refusal code.
+---
+
+`POST /v1/ingest` carries **schema_version 1** batches. The contract is versioned; a mismatch refuses
+the whole batch. The authoritative text is `docs/INGEST_CONTRACT.md` in the product repository — this
+page is the reader-friendly version.
+
+## The batch
+
+```json not-run="the wire shape, annotated in prose"
+{
+  "schema_version": 1,
+  "source": { "instance_id": "<32 hex>", "service": "checkout", "sdk": "aiops-sdk-rust/0.1.0" },
+  "stats": { "dropped_queue_full": 0, "dropped_send_failed": 0, "dropped_rejected": 0, "gap_overflow": 0, "truncated_events": 0 },
+  "events": [ { "…": "…" } ]
+}
+```
+
+- `source.instance_id` is random per process start (128-bit lowercase hex, not all zero). An instance
+  **belongs to the first ingest key that used it**: a batch claiming that instance under another key is
+  refused whole with `409 instance_owned_by_another_key` — one host can't fill another's gaps.
+- `stats` are the sender's **cumulative** counters since process start, sent every batch so the latest
+  values survive lost batches.
+
+## Every event
+
+| Field | Rule |
+|---|---|
+| `event_id` | 32 lowercase hex, not all zero; unique per project; **the dedup key — same on every re-delivery** |
+| `type` | `operation.started`, `operation.finished`, `step.started`, `step.finished`, `gap.reported` |
+| `operation_id` | 32 lowercase hex (W3C trace-id width) |
+| `seq` | ≥ 1, per source instance, in emission order — holes here are exact lost batches |
+| `op_seq` | ≥ 1, per operation within the instance; `0` only on `gap.reported` |
+| `event_time` | RFC 3339 with an offset; within 1 h ahead of / 14 days behind receive time |
+| `attributes` | optional, ≤ 32 entries; keys `[a-z0-9._]{1,64}`; values bool, integer, finite number or string ≤ 256 B |
+| `truncated` | optional count of string fields the sender cut to the caps |
+
+One event's JSON ≤ 8 KiB. Per type, **only the listed fields may appear** — anything else is
+`field_not_allowed`.
+
+## Per-type fields
+
+| Type | Required | Optional |
+|---|---|---|
+| `operation.started` | `name` | `trace_id`, `request_id`, `release`, `deployment` |
+| `operation.finished` | `outcome`, `events_emitted` (≥ `op_seq`) | `failure_class` / `uncertain_reason`, `error_code`, `error_message` |
+| `step.started` | `step_id` (16 hex), `kind`, `name`, `attempt` (1–1000) | `parent_step_id`, `model`, `prompt_version`, `config_version`, `external_effect` |
+| `step.finished` | `step_id`, `attempt`, `outcome` | `kind`, `name`, `failure_class` / `uncertain_reason`, `error_code`, `error_message`, `usage`, `cost_estimate` |
+| `gap.reported` | `dropped` (≥ 1), `reason`, `first_dropped_at`, `last_dropped_at` | — |
+
+- `kind`: `model`, `tool`, `job`, `validation`.
+- `outcome`: `succeeded` | `failed` + `failure_class` (`transport`, `rejected`, `validation`,
+  `internal`) | `uncertain` + `uncertain_reason` (`timeout_after_send`,
+  `connection_lost_after_send`, `response_unreadable`). **Declared by the host, never inferred.**
+- A cancelled run is `failed` + `error_code: cancelled` — displayed as cancelled, never inferred.
+- `gap.reported` `reason`: `queue_full`, `send_failed`, `rejected`, `shutdown`.
+- `usage`: `{input_tokens, output_tokens}` ≤ 10⁹ each. `cost_estimate`: `{micros, currency (ISO 4217),
+  basis}` — an estimate, never a bill.
+- Identifiers (`name`, `release`, `model`, …): `[A-Za-z0-9._:/@-]`, non-empty, ≤ 128 bytes
+  (`error_code` ≤ 64). `error_message`: free text ≤ 512 B; secret-shaped substrings become `[redacted]`.
+
+## Bounds and the answers they get
+
+| Bound | Default | Answer when exceeded |
+|---|---|---|
+| Body | 1 MiB | `413 payload_too_large` |
+| Events per batch | 500 | `413 too_many_events` |
+| Uncached key lookups in flight | 4 | `503 overloaded`, `Retry-After: 1` — no query spent on a bad key |
+| Ingest body bytes in flight | 32 MiB | `503 overloaded`, before any body byte is read |
+
+The body is read **only after the key authenticates from the headers**, and is charged its
+`Content-Length` (or the 1 MiB cap). Unknown keys are answered within a budget of parallel lookups —
+a flood of made-up keys can't take a known host's capacity. **Revocation takes effect within 30 s**
+(the valid-key cache's lifetime); while the lookup budget is exhausted a recently-valid key may still
+be served from cache, so worst case 5 min 30 s.
+
+## Idempotence and per-event refusal
+
+A batch returns `{accepted, duplicates, refused[]}`. Resent `event_id`s count as duplicates, never new
+events; a duplicated id under a *different* operation is refused at its own index. Per-event refusals
+carry `{index, event_id?, code, message}` — codes include `unknown_event_type`, `invalid_id`,
+`missing_field`, `field_not_allowed`, `attribute_*`, `event_too_large`, `time_out_of_range`. Batch-level
+errors are `malformed_batch`, `unsupported_schema_version`, `invalid_source`,
+`instance_owned_by_another_key`, `payload_too_large`, `too_many_events`, `overloaded`, `rate_limited`,
+`unauthenticated`, `store_unavailable`.
