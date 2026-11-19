@@ -25,7 +25,7 @@ const EXAMPLE = 'https://aiops.example.com';
 // the adapter's runner and reference host, and listen addresses and health checks in
 // self-hosting). Everywhere else is https://aiops.example.com.
 export const ALLOWED = [
-	/^src\/content\/docs\/(quick-start|cli|instrument|console)\.mdx$/, // the quick start's stack; the SDK's AIOPS_ENDPOINT; admin's database; the console's address
+	/^src\/content\/docs\/(quick-start|cli|instrument|console|recovering|audit|credentials)\.mdx$/, // the quick start's stack; the SDK's AIOPS_ENDPOINT; admin's database; the console's address; the control/audit/credential examples against the local collector and reference host
 	/^src\/content\/docs\/self-hosting\//, // listen addresses, loopback backends, local health checks
 	/^src\/content\/docs\/adapters\//, // the runner and the reference host on this machine
 	/^src\/pages\/api\/reference\.astro$/, // the reference's "the quick start on this machine" server

@@ -58,7 +58,15 @@ The response's three counters are the contract: `accepted` stored new, `duplicat
 | One operation, full record | `GET /v1/projects/{p}/operations/{id}` | read |
 | What the runner says about it | `GET /v1/projects/{p}/operations/{id}/authority` | read |
 | Releases side by side | `GET /v1/projects/{p}/releases/compare?releases=a,b` | read |
+| Ask the effect's authority (store the answer) | `POST …/operations/{id}/reconcile` | operate |
+| Resubmit the work under its business key | `POST …/operations/{id}/retry` | operate |
+| Watch a control record move | `GET …/operations/{id}/controls[/{cid}]` | read |
+| The decision log | `GET /v1/admin/audit` | admin |
+| The credential surface + revoke | `GET /v1/admin/credentials`, `POST …/credentials/{tokens,ingest-keys}/{id}/revoke` | admin |
 | The collector's own counters | `GET /v1/collector/stats` | admin |
+
+The last four groups are the surfaces in [Recovering an uncertain operation](/recovering/),
+[Reading the audit log](/audit/) and [Credentials and revocation](/credentials/).
 
 ```sh run=api
 curl -s "https://aiops.example.com/v1/projects/docs/operations?limit=1" \

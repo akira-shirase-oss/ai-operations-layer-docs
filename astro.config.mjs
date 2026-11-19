@@ -77,13 +77,18 @@ export default defineConfig({
 				},
 				{
 					label: 'Investigating',
-					items: [{ label: 'The console', slug: 'console' }],
+					items: [
+						{ label: 'The console', slug: 'console' },
+						{ label: 'Recovering an uncertain operation', slug: 'recovering' },
+						{ label: 'Reading the audit log', slug: 'audit' },
+					],
 				},
 				{
 					label: 'HTTP API',
 					items: [
 						{ label: 'Which API, when', slug: 'api' },
 						{ label: 'Authentication and keys', slug: 'api/authentication' },
+						{ label: 'Credentials and revocation', slug: 'credentials' },
 						{ label: 'Errors', slug: 'errors' },
 					],
 				},

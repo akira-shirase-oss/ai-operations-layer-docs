@@ -50,11 +50,11 @@ export const EXAMPLE_BASE = 'https://aiops.example.com';
 const DEFAULT_BASE = 'http://127.0.0.1:57400';
 /** The other local address pages show: the development PostgreSQL from the product's compose file. */
 const SHOWN_DB = 'postgres://aiops:aiops-dev@127.0.0.1:57432/aiops';
-const LOCAL_PAGES = /content\/docs\/(quick-start|cli|instrument|console)\.mdx$|content\/docs\/self-hosting\/|content\/docs\/adapters\//;
+const LOCAL_PAGES = /content\/docs\/(quick-start|cli|instrument|console|recovering|audit|credentials)\.mdx$|content\/docs\/self-hosting\/|content\/docs\/adapters\//;
 /** The address a page shows its examples with. */
 export const shownBase = (file) => (LOCAL_PAGES.test(file ?? '') ? DEFAULT_BASE : EXAMPLE_BASE);
 /** Suites in the order they run; later suites build on the state earlier ones leave. */
-const SUITES = ['quickstart', 'ingest', 'api', 'sdk', 'cli', 'ops'];
+const SUITES = ['quickstart', 'ingest', 'api', 'sdk', 'cli', 'ops', 'control'];
 
 const args = process.argv.slice(2);
 const flag = (name) => args.includes(`--${name}`);
@@ -213,6 +213,9 @@ export function normalise(text) {
 		.replace(/\b[0-9a-f]{40}\b/g, '<commit>')
 		.replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z/g, '<time>')
 		.replace(/"(receive_delay_us|duration_us|cost_estimate_micros)":-?\d+/g, '"$1":<us>')
+		.replace(/"request_id":"[^"]+"/g, '"request_id":"<id>"')
+		.replace(/"control_id":"[^"]+"/g, '"control_id":"<uuid>"')
+		.replace(/"submitted_ref":"[^"]+"/g, '"submitted_ref":"<ref>"')
 		.replace(/"finished_at_ms":\d+/g, '"finished_at_ms":<ms>')
 		.replace(/"read_at":"[^"]+"/g, '"read_at":"<time>"')
 		.replace(/^date: .*$/gim, 'date: <date>')

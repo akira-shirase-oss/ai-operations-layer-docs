@@ -1,0 +1,150 @@
+---
+title: Recovering an uncertain operation
+description: "Reconcile vs. retry: how the control path asks the effect's authority, refuses to guess, and prevents a double effect — with every denial audited."
+---
+
+This page runs **on your machine**: the suite brings up a collector, a fresh `docs` project, and the
+reference host — the same fake publisher the product's own failure drills use — wired as the project's
+control adapter. Everything below is a real call against that stack.
+
+{/* snippet control: snippets/restart.sh */}
+
+An operation whose publish step finished `uncertain` is the case this exists for: *the request left
+the host; the effect may have happened.* The wrong move is a blind retry — if the publish landed, a
+second one is a double effect. The control path exists so the right move is cheap, audited, and
+impossible to do silently.
+
+Two actions exist. **Reconcile** asks the effect's authority and stores the answer; it changes nothing
+outside the layer. **Retry** resubmits the work — only after the authority's own checks, under the
+stable business key, so an already-landed effect can never be doubled. There is no generic "run
+again": every call names its operation, its business key, and what the caller asserts the authority's
+state to be (`expected_state`).
+
+## The scenario
+
+An operation arrived whose publish step declared `uncertain — timeout_after_send`:
+
+```sh run=control
+curl -s http://127.0.0.1:57400/v1/ingest \
+  -H "Authorization: Bearer $AIOPS_INGEST_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": 1,
+    "source": {"instance_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "service": "articles", "sdk": "aiops-sdk-rust/0.1.0"},
+    "stats": {"dropped_queue_full": 0, "dropped_send_failed": 0, "dropped_rejected": 0, "gap_overflow": 0, "truncated_events": 0},
+    "events": [
+      {"event_id": "a1111111111111111111111111111111", "type": "operation.started", "operation_id": "b2222222222222222222222222222222", "seq": 1, "op_seq": 1, "event_time": "2026-11-19T09:00:00Z", "name": "publish_article", "request_id": "req-demo"},
+      {"event_id": "c3333333333333333333333333333333", "type": "step.started", "operation_id": "b2222222222222222222222222222222", "seq": 2, "op_seq": 2, "event_time": "2026-11-19T09:00:01Z", "step_id": "4444444444444444", "kind": "tool", "name": "publish", "attempt": 1, "external_effect": true},
+      {"event_id": "d5555555555555555555555555555555", "type": "step.finished", "operation_id": "b2222222222222222222222222222222", "seq": 3, "op_seq": 3, "event_time": "2026-11-19T09:00:03Z", "step_id": "4444444444444444", "attempt": 1, "outcome": "uncertain", "uncertain_reason": "timeout_after_send", "error_code": "publish_timeout"},
+      {"event_id": "e7777777777777777777777777777777", "type": "operation.finished", "operation_id": "b2222222222222222222222222222222", "seq": 4, "op_seq": 4, "event_time": "2026-11-19T09:00:03Z", "outcome": "uncertain", "uncertain_reason": "timeout_after_send", "error_code": "publish_timeout", "events_emitted": 4}
+    ]
+  }'
+```
+
+```json output=control
+{"accepted":4,"duplicates":0,"refused":[]}
+```
+
+Telemetry says `uncertain`. It cannot say whether the article landed — and it will never pretend to.
+
+## Step 1: reconcile — ask the authority, store the answer
+
+`POST …/reconcile` reads the **effect's own authority** (the host's publication record), not the
+telemetry, and stores the read on a control record:
+
+```sh run=control
+curl -s http://127.0.0.1:57400/v1/projects/docs/operations/b2222222222222222222222222222222/reconcile \
+  -X POST -H "Authorization: Bearer $AIOPS_OPERATE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"business_key": "article:demo", "expected_state": {"published": false}}'
+```
+
+```json output=control
+{
+  "control_id": "<uuid>",
+  "action": "reconcile",
+  "status": "reconciled",
+  "business_key": "article:demo",
+  "actor": "docs-ops",
+  "approved_by": null,
+  "approved_at": null,
+  "resolution": "effect_absent",
+  "authority_read": { "source": "publications", "status": 404, "answer": null, "read_at": "<time>" },
+  "submitted_ref": null,
+  "denied_reason": null,
+  "attempts": 0,
+  "created_at": "<time>",
+  "updated_at": "<time>",
+  "replayed": false
+}
+```
+
+`resolution: "effect_absent"` is the authority's answer — the publish never landed. The
+`authority_read` snapshot (status `404`) is stored *with* the record: the decision's evidence travels
+with it. When the authority can't answer in the read bound, the resolution is `still_uncertain` —
+recorded honestly, never guessed.
+
+Sending the same call again returns the stored record (`replayed: true`); sending it with a
+**different** `expected_state` is refused `409 conflicting_request` — the record stands and the
+conflict is audited:
+
+```sh run=control
+curl -s http://127.0.0.1:57400/v1/projects/docs/operations/b2222222222222222222222222222222/reconcile \
+  -X POST -H "Authorization: Bearer $AIOPS_OPERATE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"business_key": "article:demo", "expected_state": {"published": true}}' \
+  | python3 -c 'import sys,json; print("code:", json.load(sys.stdin)["error"]["code"])'
+```
+
+```text output=control
+code: conflicting_request
+```
+
+## Step 2: retry — only because the effect is absent
+
+`POST …/retry` runs the authority checks again: it is authorized only when the effect is **confirmed
+absent** *and* the caller's `expected_state` matches. An effect that already happened is denied
+`effect_confirmed` — the correct recovery for a landed effect is none. The decision, the authority
+snapshot and the audit row commit in one transaction; the resubmission happens only after, and its
+outcome is observed against the authority — never assumed.
+
+```sh run=control
+CID=$(curl -s http://127.0.0.1:57400/v1/projects/docs/operations/b2222222222222222222222222222222/retry \
+  -X POST -H "Authorization: Bearer $AIOPS_OPERATE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"business_key": "article:demo", "expected_state": {"published": false}}' \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["status"], file=sys.stderr); print(d["control_id"])')
+for i in $(seq 1 40); do
+  S=$(curl -s "http://127.0.0.1:57400/v1/projects/docs/operations/b2222222222222222222222222222222/controls/$CID" \
+    -H "Authorization: Bearer $AIOPS_TOKEN" | python3 -c 'import sys,json; print(json.load(sys.stdin)["status"])')
+  [ "$S" = "confirmed" ] || [ "$S" = "submit_failed" ] || [ "$S" = "observed_unknown" ] && break
+  sleep 0.25
+done
+echo "retry ended: $S"
+```
+
+```text output=control
+retry ended: confirmed
+```
+
+The resubmission itself is **exactly-once at the host**: it went under the same business key, so the
+publisher's own dedup — not telemetry — is what prevents a double publish. `GET …/controls` lists the
+records; `GET …/controls/{id}` watches one drive forward (`submitted → confirmed | submit_failed |
+observed_unknown`).
+
+## What a denial looks like
+
+Controls are refused before they can act, and every refusal is audited. A project with no control
+adapter denies the call outright — adapters are opt-in per project, never assumed:
+
+```sh run=control
+./target/release/aiops-server admin create-project other >/dev/null
+curl -s http://127.0.0.1:57400/v1/projects/other/operations/b2222222222222222222222222222222/reconcile \
+  -X POST -H "Authorization: Bearer $AIOPS_OPERATE_TOKEN" -H "Content-Type: application/json" \
+  -d '{"business_key": "article:x", "expected_state": {"published": false}}' \
+  | python3 -c 'import sys,json; print("status:", "denied", "| code:", json.load(sys.stdin)["error"]["code"])'
+```
+
+```text output=control
+status: denied | code: forbidden
+```
+
+A read-scope token attempting a control call is denied the same way (`scope_missing` in the audit
+row), and a token without the project is denied without ever learning whether the operation exists.
+Denials are first-class decisions — see [Reading the audit log](/audit/).

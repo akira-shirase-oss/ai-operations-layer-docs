@@ -1,0 +1,73 @@
+---
+title: Reading the audit log
+description: "GET /v1/admin/audit — what is recorded, what is never recorded, filters, and the cursor. Runs on this machine."
+---
+
+Everything on this page runs on your machine — the suite resets the collector and mints the admin
+token the route requires.
+
+{/* snippet control: snippets/restart.sh */}
+
+`GET /v1/admin/audit` is the decision log. It records **actions that change or deny something**:
+credential mints and revokes, control calls (each authorized or denied — a denial is a decision, not
+an absence), and every scoped admin denial. Two rules hold the boundary:
+
+- **The read itself is never audited.** A read that wrote a row into the log it reads would grow the
+  log on every page turn. Denials, however, are audited everywhere — including denied reads of this
+  very route.
+- **Metadata only.** Each row carries who, what, when, the decision and its reason — never a secret,
+  a digest or a request body. No credential material exists in `audit_log`, so none can leak.
+
+It needs the `admin` scope and runs on the control pool, so an incident read can't starve behind a
+query flood.
+
+## Producing rows worth reading
+
+Revoking a credential is audited `admin.revoke_ingest_key` — and a *denied* call is audited too. A
+read-only token asking for the audit log is refused `403` and leaves a `denied` row behind:
+
+```sh run=control
+KID=$(curl -s http://127.0.0.1:57400/v1/admin/credentials -H "Authorization: Bearer $AIOPS_ADMIN_TOKEN" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["ingest_keys"][0]["id"])')
+curl -s -X POST "http://127.0.0.1:57400/v1/admin/credentials/ingest-keys/$KID/revoke" -H "Authorization: Bearer $AIOPS_ADMIN_TOKEN"; echo
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:57400/v1/admin/audit -H "Authorization: Bearer $AIOPS_TOKEN"
+```
+
+```text output=control
+{"id":"<uuid>","revoked":true}
+403
+```
+
+## Reading it back
+
+```sh run=control
+curl -s "http://127.0.0.1:57400/v1/admin/audit?limit=10" -H "Authorization: Bearer $AIOPS_ADMIN_TOKEN" \
+  | python3 -c 'import sys,json
+for r in json.load(sys.stdin)["audit"]:
+    print(r["actor"], "|", r["action"], "|", r["decision"], "|", r["reason"])'
+```
+
+```text output=control
+docs | audit.list | denied | scope_missing
+ops | admin.revoke_ingest_key | allowed | revoked
+```
+
+Newest first: the denied read (actor `docs`, reason `scope_missing`) sits above the allowed revoke
+(actor `ops`). The fields on each row are `id`, `at`, `actor`, `token_id`, `action`, `project_slug`,
+`target`, `decision`, `reason`.
+
+## Filters and the cursor
+
+`action`, `actor`, `token` (the acting token's id), and a `from`/`to` window narrow the page;
+`limit` caps it at 100. A full page returns `next` — pass it back as `before_time`/`before_id`:
+
+```sh run=control
+curl -s "http://127.0.0.1:57400/v1/admin/audit?action=audit.list" -H "Authorization: Bearer $AIOPS_ADMIN_TOKEN" \
+  | python3 -c 'import sys,json; a=json.load(sys.stdin)["audit"]; print(len(a), "denied read row(s), decision:", a[0]["decision"])'
+```
+
+```text output=control
+1 denied read row(s), decision: denied
+```
+
+`before_time` without `before_id` is a `400` — they go together.
