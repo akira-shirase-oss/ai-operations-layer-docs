@@ -269,15 +269,23 @@ const runOrDie = (cmd, args) => {
 
 /**
  * One mechanism owns the product source: before any step runs, .snippets/work/ai-operations-layer
- * is an ai-operations-layer checkout at PRODUCT_REF. A missing dir is cloned; a dir that exists
- * without .git — a restored build cache holding only target/, as CI's rust-cache step leaves — is
- * fetched into rather than deleted, so the cache still warms the build. An existing checkout is
- * left alone unless AIOPS_LAYER_REF was set explicitly. Afterwards the dir must be a source tree,
- * not just a directory — anything else stops the suite here with a readable message, not a cargo error.
+ * is an ai-operations-layer checkout at PRODUCT_REF. On CI the job checks the product out there
+ * before rust-cache runs — if the dir is missing under GitHub Actions, that step never ran, and
+ * failing here names the gap instead of silently cloning behind a cache the suite was meant to
+ * keep warm. Locally a missing dir is cloned; a dir that exists without .git — a restored build
+ * cache holding only target/, as CI's rust-cache step leaves — is fetched into rather than
+ * deleted, so the cache still warms the build. An existing checkout is left alone unless
+ * AIOPS_LAYER_REF was set explicitly. Afterwards the dir must be a source tree, not just a
+ * directory — anything else stops the suite here with a readable message, not a cargo error.
  */
 function ensureProductCheckout() {
 	const dir = join(workdir, 'ai-operations-layer');
-	mkdirSync(workdir, { recursive: true });
+	try {
+		mkdirSync(workdir, { recursive: true });
+	} catch (err) {
+		console.error(`snippets: the work dir ${relative(ROOT, workdir)} can't be created: ${err.message}`);
+		process.exit(1);
+	}
 	if (!existsSync(join(dir, '.git'))) {
 		if (existsSync(dir)) {
 			console.error(`snippets: ${relative(ROOT, dir)} exists but is not a checkout — fetching ${PRODUCT_REF} into it (keeps a restored target/ cache)`);
@@ -286,6 +294,11 @@ function ensureProductCheckout() {
 			gitIn(dir, 'remote', 'add', 'origin', PRODUCT_URL);
 			gitIn(dir, 'fetch', '-q', '--depth', '1', 'origin', PRODUCT_REF);
 			gitIn(dir, 'checkout', '-q', '--detach', 'FETCH_HEAD');
+		} else if (process.env.GITHUB_ACTIONS === 'true') {
+			console.error(
+				`snippets: ${relative(ROOT, dir)} is missing — the job's "Check out ai-operations-layer" step puts the product there before rust-cache runs; check ci.yml's step order`,
+			);
+			process.exit(1);
 		} else {
 			runOrDie('git', ['clone', '-q', '--depth', '1', '-b', PRODUCT_REF, PRODUCT_URL, dir]);
 		}
@@ -299,6 +312,9 @@ function ensureProductCheckout() {
 	}
 	console.error(`snippets: ai-operations-layer ${gitIn(dir, 'describe', '--tags', '--always')} (ref ${PRODUCT_REF})`);
 }
+
+/** The pidfile restart.sh reads for a step that ends by backgrounding a process, else null. */
+export const recordedPidfile = (code) => (/&\s*$/.test(code) ? (/reference-host/.test(code) ? '.refhost.pid' : '.srv.pid') : null);
 
 // ---------------------------------------------------------------- running a suite
 
@@ -347,6 +363,11 @@ function runAll(steps) {
 		const streams = meta(step.info, 'stderr') === '1' ? ' 2>&1' : '';
 		if (expected === undefined) {
 			lines.push(marker, `source ${JSON.stringify(source)} > ${JSON.stringify(out)}${streams}`);
+			// A block that backgrounds a process (the quick start's `serve &`) leaves the pid in $!
+			// — record it so restart.sh's pidfile loop covers it. Only the last background job is
+			// captured; the pages carry exactly one.
+			const pidfile = recordedPidfile(code);
+			if (pidfile) lines.push(`echo $! > ${JSON.stringify(join(workdir, 'ai-operations-layer', pidfile))}`);
 		} else {
 			lines.push(
 				marker,

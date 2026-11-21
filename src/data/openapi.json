@@ -1869,12 +1869,27 @@
 						"items": {
 							"$ref": "#/components/schemas/RefusedEvent"
 						}
+					},
+					"withheld_attributes": {
+						"type": "integer",
+						"description": "Attribute keys the default-deny policy withheld, summed over the batch — attributes are opt-in per project; counted, never stored."
+					},
+					"redactions": {
+						"type": "integer",
+						"description": "Secret-shaped strings replaced with `[redacted]` inside stored values, summed over the batch."
+					},
+					"overflowed_names": {
+						"type": "integer",
+						"description": "Operation and step names over the project's or the key's cardinality budget; the events store under the `_overflow` name."
 					}
 				},
 				"required": [
 					"accepted",
 					"duplicates",
-					"refused"
+					"refused",
+					"withheld_attributes",
+					"redactions",
+					"overflowed_names"
 				]
 			},
 			"ProjectView": {

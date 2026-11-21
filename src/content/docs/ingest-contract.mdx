@@ -78,8 +78,14 @@ be served from cache, so worst case 5 min 30 s.
 
 ## Idempotence and per-event refusal
 
-A batch returns `{accepted, duplicates, refused[]}`. Resent `event_id`s count as duplicates, never new
-events; a duplicated id under a *different* operation is refused at its own index. Per-event refusals
+A batch returns `{accepted, duplicates, refused[], withheld_attributes, redactions, overflowed_names}`.
+Resent `event_id`s count as duplicates, never new
+events; a duplicated id under a *different* operation is refused at its own index. The last three
+counters report what the policies filtered, summed over the batch: `withheld_attributes` counts
+attribute keys the default-deny policy dropped (attributes are opt-in per project),
+`redactions` counts secret-shaped strings replaced with `[redacted]` inside stored values, and
+`overflowed_names` counts operation and step names over the cardinality budget, stored under the
+`_overflow` name. Per-event refusals
 carry `{index, event_id?, code, message}` — codes include `unknown_event_type`, `invalid_id`,
 `missing_field`, `field_not_allowed`, `attribute_*`, `event_too_large`, `time_out_of_range`. Batch-level
 errors are `malformed_batch`, `unsupported_schema_version`, `invalid_source`,

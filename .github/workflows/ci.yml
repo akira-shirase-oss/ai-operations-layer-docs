@@ -159,10 +159,19 @@ jobs:
       - run: npm ci
       - name: The steps the pages run, in order
         run: node scripts/snippets.mjs --list
-      # scripts/snippets.mjs owns the product checkout at the ref AIOPS_LAYER_REF names — main on
-      # pushes and the nightly. It clones or fetches before step 0 (into the dir rust-cache may
-      # already have restored, keeping the warm target/), so the quick start's own install block
-      # finds a checkout and only builds, as it does for a reader.
+      # The product checkout must exist before rust-cache: the cache step runs `cargo metadata`
+      # in the workspace below, and without a checkout it errors on a missing cwd and computes a
+      # key over zero lockfiles — always cold. scripts/snippets.mjs still owns the ref: when
+      # AIOPS_LAYER_REF is set it fetches and detaches that ref over whatever is here, so the
+      # quick start's own install block finds a checkout and only builds, as it does for a
+      # reader.
+      - name: Check out ai-operations-layer where the suite and the cache look for it
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: akira-shirase-oss/ai-operations-layer
+          ref: ${{ github.event_name == 'schedule' && 'main' || inputs.product-ref || 'main' }}
+          path: .snippets/work/ai-operations-layer
+          persist-credentials: false
       - name: Install the pinned Rust toolchain the product asks for
         run: |
           rustup --version

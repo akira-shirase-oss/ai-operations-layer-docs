@@ -41,7 +41,7 @@ curl -s http://127.0.0.1:57400/v1/ingest \
 ```
 
 ```json output=control
-{"accepted":4,"duplicates":0,"refused":[]}
+{"accepted":4,"duplicates":0,"refused":[],"withheld_attributes":0,"redactions":0,"overflowed_names":0}
 ```
 
 Telemetry says `uncertain`. It cannot say whether the article landed — and it will never pretend to.
@@ -67,7 +67,7 @@ curl -s http://127.0.0.1:57400/v1/projects/docs/operations/b22222222222222222222
   "approved_by": null,
   "approved_at": null,
   "resolution": "effect_absent",
-  "authority_read": { "source": "publications", "status": 404, "answer": null, "read_at": "<time>" },
+  "authority_read": { "answer": { "business_key": "article:demo", "published": false }, "read_at": "<time>", "source": "publications", "status": 404 },
   "submitted_ref": null,
   "denied_reason": null,
   "attempts": 0,
@@ -78,9 +78,10 @@ curl -s http://127.0.0.1:57400/v1/projects/docs/operations/b22222222222222222222
 ```
 
 `resolution: "effect_absent"` is the authority's answer — the publish never landed. The
-`authority_read` snapshot (status `404`) is stored *with* the record: the decision's evidence travels
-with it. When the authority can't answer in the read bound, the resolution is `still_uncertain` —
-recorded honestly, never guessed.
+`authority_read` snapshot is stored *with* the record: the decision's evidence travels with it.
+Status `404` is the host's "not published", and `answer` carries the authority's own reply verbatim —
+here its `published: false` record for the key, not an inference. When the authority can't answer in
+the read bound, the resolution is `still_uncertain` — recorded honestly, never guessed.
 
 Sending the same call again returns the stored record (`replayed: true`); sending it with a
 **different** `expected_state` is refused `409 conflicting_request` — the record stands and the
@@ -120,13 +121,20 @@ echo "retry ended: $S"
 ```
 
 ```text output=control
-retry ended: confirmed
+retry ended: submit_failed
 ```
 
-The resubmission itself is **exactly-once at the host**: it went under the same business key, so the
-publisher's own dedup — not telemetry — is what prevents a double publish. `GET …/controls` lists the
-records; `GET …/controls/{id}` watches one drive forward (`submitted → confirmed | submit_failed |
-observed_unknown`).
+The record ends `submit_failed` — and that is the authority's answer too, not a guess. Telemetry
+described a publish attempt under `article:demo`, but this walkthrough only *sent* telemetry: the
+host — the effect's own record — holds no request under that key, so it refuses the resubmit
+(`404`), the refusal is final, and the record says so beside its audit row. A request the host does
+hold resubmits to `confirmed`; an effect that already landed is denied `effect_confirmed` before any
+submission. Nothing in the path recreates work from telemetry alone.
+
+When a resubmit does go through, it is **exactly-once at the host**: it goes under the same business
+key, so the publisher's own dedup — not telemetry — is what prevents a double publish.
+`GET …/controls` lists the records; `GET …/controls/{id}` watches one drive forward (`submitted →
+confirmed | submit_failed | observed_unknown`).
 
 ## What a denial looks like
 
