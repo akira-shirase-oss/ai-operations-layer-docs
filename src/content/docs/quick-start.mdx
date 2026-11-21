@@ -104,11 +104,24 @@ curl -s http://127.0.0.1:57400/v1/ingest \
 ```
 
 ```json output=quickstart
-{"accepted":4,"duplicates":0,"refused":[]}
+{"accepted":4,"duplicates":0,"refused":[],"withheld_attributes":0,"redactions":0,"overflowed_names":0}
 ```
 
 Send the same batch again and `duplicates` counts it — `event_id` is the dedup key for the whole path.
 A resend is never a second event.
+
+The last three counters report what the collector's policies filtered, and all three are zero on a
+clean batch:
+
+- **`withheld_attributes`** — attribute keys the default-deny policy dropped before storing.
+  Attributes are opt-in per project (`admin set-opt-in`); a non-zero count means the batch carried
+  keys the project does not admit. The events still store — only the attribute is withheld.
+- **`redactions`** — secret-shaped strings replaced with `[redacted]` inside stored values. A
+  non-zero count means credential-shaped material reached the wire and is gone at the edge; fix the
+  emitter, not the policy.
+- **`overflowed_names`** — operation and step names over the project's or the key's cardinality
+  budget. The events store under the `_overflow` name, so a rising count is a signal about the
+  emitter's name hygiene, not lost events.
 
 ## 6. The real API call
 

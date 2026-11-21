@@ -43,11 +43,15 @@ curl -s https://aiops.example.com/v1/ingest \
 ```
 
 ```json output=api
-{"accepted":1,"duplicates":0,"refused":[]}
+{"accepted":1,"duplicates":0,"refused":[],"withheld_attributes":0,"redactions":0,"overflowed_names":0}
 ```
 
-The response's three counters are the contract: `accepted` stored new, `duplicates` idempotent resends,
-`refused` per-event rejections with codes — never a silent drop. Rules: [the ingest contract](/ingest-contract/).
+The response's counters are the contract: `accepted` stored new, `duplicates` idempotent resends,
+`refused` per-event rejections with codes — never a silent drop. `withheld_attributes`,
+`redactions` and `overflowed_names` count what the privacy and cardinality policies filtered —
+attribute keys the project did not opt in, secret-shaped strings replaced with `[redacted]`, and
+names stored under `_overflow` past the budget. All three are zero here. Rules: [the ingest
+contract](/ingest-contract/).
 
 ## Query — what the console uses
 
