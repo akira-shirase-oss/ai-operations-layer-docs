@@ -2,6 +2,11 @@
 // times and hashes normalise away, and a real difference still fails.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { normalise, matches, runnable, coverage, fences, shownBase, EXAMPLE_BASE } from './snippets.mjs';
 
 test('the example domain becomes the stack under test', () => {
@@ -72,4 +77,19 @@ test('shownBase picks the address a page pretends to use', () => {
 	assert.equal(shownBase('src/content/docs/quick-start.mdx'), 'http://127.0.0.1:57400');
 	assert.equal(shownBase('src/content/docs/self-hosting/configuration.mdx'), 'http://127.0.0.1:57400');
 	assert.equal(shownBase('src/content/docs/api/index.mdx'), EXAMPLE_BASE);
+});
+
+test('a missing product checkout fails with a clear message on CI, not a clone behind the cache', () => {
+	// CI checks the product out before rust-cache; if the dir is absent there, the step never
+	// ran — say so. Locally the runner still clones. The spawn's timeout bounds a red run that
+	// would otherwise try the network.
+	const work = join(mkdtempSync(join(tmpdir(), 'snippets-')), 'work');
+	const result = spawnSync(process.execPath, [fileURLToPath(new URL('./snippets.mjs', import.meta.url)), '--cwd', work], {
+		env: { ...process.env, GITHUB_ACTIONS: 'true' },
+		encoding: 'utf8',
+		timeout: 20_000,
+	});
+	assert.equal(result.status, 1, `expected exit 1, got ${result.status}: ${result.stderr.slice(0, 200)}`);
+	assert.match(result.stderr, /ai-operations-layer.*missing|missing.*ai-operations-layer/, 'names the missing checkout');
+	assert.match(result.stderr, /check out|checkout/i, 'says what should have provided it');
 });
