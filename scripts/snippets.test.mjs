@@ -7,7 +7,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalise, matches, runnable, coverage, fences, shownBase, EXAMPLE_BASE } from './snippets.mjs';
+import { normalise, matches, runnable, coverage, fences, shownBase, recordedPidfile, EXAMPLE_BASE } from './snippets.mjs';
 
 test('the example domain becomes the stack under test', () => {
 	assert.equal(runnable('curl -i $BASE/healthz'), 'curl -i $BASE/healthz');
@@ -77,6 +77,13 @@ test('shownBase picks the address a page pretends to use', () => {
 	assert.equal(shownBase('src/content/docs/quick-start.mdx'), 'http://127.0.0.1:57400');
 	assert.equal(shownBase('src/content/docs/self-hosting/configuration.mdx'), 'http://127.0.0.1:57400');
 	assert.equal(shownBase('src/content/docs/api/index.mdx'), EXAMPLE_BASE);
+});
+
+test('a block that backgrounds a process gets a pidfile for restart.sh', () => {
+	const serve = 'AIOPS_LISTEN=127.0.0.1:57400 ./target/release/aiops-server serve >/dev/null 2>&1 &';
+	assert.equal(recordedPidfile(runnable(serve)), '.srv.pid', 'the quick start serve is tracked');
+	assert.equal(recordedPidfile('./target/release/reference-host &'), '.refhost.pid');
+	assert.equal(recordedPidfile('curl -s http://127.0.0.1:57400/readyz'), null, 'a foreground block records nothing');
 });
 
 test('a missing product checkout fails with a clear message on CI, not a clone behind the cache', () => {

@@ -313,6 +313,9 @@ function ensureProductCheckout() {
 	console.error(`snippets: ai-operations-layer ${gitIn(dir, 'describe', '--tags', '--always')} (ref ${PRODUCT_REF})`);
 }
 
+/** The pidfile restart.sh reads for a step that ends by backgrounding a process, else null. */
+export const recordedPidfile = (code) => (/&\s*$/.test(code) ? (/reference-host/.test(code) ? '.refhost.pid' : '.srv.pid') : null);
+
 // ---------------------------------------------------------------- running a suite
 
 function runAll(steps) {
@@ -360,6 +363,11 @@ function runAll(steps) {
 		const streams = meta(step.info, 'stderr') === '1' ? ' 2>&1' : '';
 		if (expected === undefined) {
 			lines.push(marker, `source ${JSON.stringify(source)} > ${JSON.stringify(out)}${streams}`);
+			// A block that backgrounds a process (the quick start's `serve &`) leaves the pid in $!
+			// — record it so restart.sh's pidfile loop covers it. Only the last background job is
+			// captured; the pages carry exactly one.
+			const pidfile = recordedPidfile(code);
+			if (pidfile) lines.push(`echo $! > ${JSON.stringify(join(workdir, 'ai-operations-layer', pidfile))}`);
 		} else {
 			lines.push(
 				marker,

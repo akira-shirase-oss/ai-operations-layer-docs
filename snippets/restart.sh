@@ -6,18 +6,60 @@
 set -u
 cd "$SNIPPET_HOME/ai-operations-layer"
 export AIOPS_DATABASE_URL="$AIOPS_DB"
-BIN="$SNIPPET_HOME/ai-operations-layer/target/release/aiops-server"
+# pwd -P: the guard compares a holder's executable against $BIN, and /proc/lsof report
+# realpaths — a symlinked workdir would otherwise refuse the suite's own server.
+BIN="$(pwd -P)/target/release/aiops-server"
 REFPORT=57401
 export REFHOST_BASE="http://127.0.0.1:$REFPORT"
 
-# Stop the running collector and the reference host, if any.
+# Stop the running collector and the reference host, if any. `kill` gets `|| true`: the pid can
+# die between `kill -0` and `kill`, and without it a set -e run stops here with no message.
 for pidfile in .srv.pid .refhost.pid; do
 	if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
-		kill "$(cat "$pidfile")" 2>/dev/null
+		kill "$(cat "$pidfile")" 2>/dev/null || true
 		for _ in $(seq 1 100); do kill -0 "$(cat "$pidfile")" 2>/dev/null || break; sleep 0.1; done
 	fi
 	rm -f "$pidfile"
 done
+
+# The pidfiles cover what this script started, and the snippet runner records the quick start's
+# `serve &` in .srv.pid too. Anything still listening on the suite port is either a suite-owned
+# serve that lost its record — argv[0] is this checkout's own binary — or a foreign process, maybe
+# a maintainer's own collector on the same default port. A test script may only stop processes it
+# started: free a suite-owned holder, refuse a foreign one. lsof first (same syntax on macOS and
+# Linux); fuser only when lsof is absent — a BSD fuser exists on macOS and can't read TCP sockets.
+PORT="${BASE##*:}"
+listeners() {
+	if command -v lsof >/dev/null 2>&1; then
+		lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null
+	elif command -v fuser >/dev/null 2>&1; then
+		fuser "$PORT/tcp" 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$'
+	fi
+}
+# The executable behind a pid: /proc on Linux, the first text mapping elsewhere (macOS lsof).
+exe_of() {
+	if [ -r "/proc/$1/exe" ]; then
+		readlink "/proc/$1/exe" 2>/dev/null
+	elif command -v lsof >/dev/null 2>&1; then
+		lsof -a -p "$1" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+	fi
+}
+for pid in $(listeners); do
+	cmd="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+	[ -n "$cmd" ] || { kill -0 "$pid" 2>/dev/null || continue; cmd='?'; }
+	# Prove the holder is the suite's own before touching it: the running executable is this
+	# checkout's binary, or argv[0] is $BIN as a serve this script launched has. Anything else is
+	# foreign — refuse, never kill.
+	exe="$(exe_of "$pid")"
+	case "$cmd" in "$BIN" | "$BIN "*) exe="$BIN" ;; esac
+	if [ "$exe" = "$BIN" ]; then
+		kill "$pid" 2>/dev/null || true
+		continue
+	fi
+	echo "restart: port $PORT is held by $pid $cmd, not started by this suite; stop it or set BASE to another port" >&2
+	return 1
+done
+for _ in $(seq 1 100); do [ -z "$(listeners)" ] && break; sleep 0.1; done
 
 # Empty the database and migrate again — same thing the product's own test stack does.
 # The schema lives in the AIOPS_DB database itself; connecting to "postgres" would reset nothing.
